@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>Airfetch</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <div class="toolbar-left">
+      <button id="btn-paste" class="icon-btn" title="Download URL from clipboard (⌘V)" data-icon="plus"></button>
+      <button id="btn-folder" class="icon-btn" title="Open download folder" data-icon="folder"></button>
+      <button id="btn-settings" class="icon-btn" title="Preferences (⌘,)" data-icon="gear"></button>
+    </div>
+    <div class="toolbar-title">Airfetch</div>
+    <div class="toolbar-right">
+      <div class="segmented" id="mode-picker" role="tablist">
+        <button data-mode="video" class="active icon-only" data-icon="film" title="Video"></button>
+        <button data-mode="audio" class="icon-only" data-icon="music" title="Audio"></button>
+      </div>
+    </div>
+  </header>
+
+  <main id="page">
+    <div id="error-banner" hidden>
+      <span class="inline-icon warn" data-icon="warn"></span>
+      <div class="error-body">
+        <div id="error-message"></div>
+      </div>
+      <button id="error-dismiss" class="icon-btn small plain" data-icon="x"></button>
+    </div>
+
+    <div id="history-header" hidden>
+      <div class="title-row">
+        <h2>History</h2>
+        <span id="history-count" class="count">0</span>
+      </div>
+      <div class="history-controls">
+        <div class="search">
+          <span class="inline-icon" data-icon="search"></span>
+          <input id="search" type="text" placeholder="Search" />
+        </div>
+        <div class="pill-select">
+          <span class="inline-icon" data-icon="filter"></span>
+          <select id="mode-filter">
+            <option value="">All</option>
+            <option value="video">Video</option>
+            <option value="audio">Audio</option>
+          </select>
+        </div>
+        <button id="history-menu" class="icon-btn small" title="More" data-icon="more"></button>
+      </div>
+    </div>
+
+    <div id="rows" class="rows"></div>
+
+    <div id="empty-state" class="empty-state" hidden>
+      <div class="empty-icon" data-icon="download"></div>
+      <h3>No downloads yet</h3>
+      <p>Copy a video URL, then press ⌘V or click the paste button in the toolbar.</p>
+    </div>
+  </main>
+
+  <!-- Onboarding sheet -->
+  <div id="onboarding" class="sheet" hidden>
+    <div class="sheet-backdrop"></div>
+    <div class="sheet-card onboarding-card">
+      <section id="install-phase">
+        <div class="onboard-hero">
+          <div class="big-icon" data-icon="download"></div>
+          <h1>Setting up the Downloader Engine</h1>
+        </div>
+        <div id="install-status" class="install-status">
+          <div class="spinner"></div>
+          <div class="label">Preparing…</div>
+        </div>
+        <footer class="sheet-footer">
+          <button id="install-continue" class="primary" disabled>Continue</button>
+        </footer>
+      </section>
+
+      <section id="browser-phase" hidden>
+        <div class="onboard-hero">
+          <div class="big-icon app" data-icon="sparkle"></div>
+          <h1>Welcome to Airfetch</h1>
+          <p>Pick the browser you're signed in with. Airfetch uses its cookies so logged-in videos download without friction.</p>
+        </div>
+        <div id="browser-grid" class="browser-grid"></div>
+        <footer class="sheet-footer">
+          <div id="browser-selected" class="footer-status"></div>
+          <button id="browser-continue" class="primary" disabled>Continue</button>
+        </footer>
+      </section>
+    </div>
+  </div>
+
+  <!-- Settings sheet -->
+  <div id="settings" class="sheet" hidden>
+    <div class="sheet-backdrop"></div>
+    <div class="sheet-card settings-card">
+      <header class="settings-header">
+        <div class="tabs" id="settings-tabs">
+          <button data-tab="general" class="active" data-icon="gear"><span>General</span></button>
+          <button data-tab="cookies" data-icon="key"><span>Cookies</span></button>
+          <button data-tab="format" data-icon="film"><span>Format</span></button>
+          <button data-tab="processing" data-icon="tag"><span>Processing</span></button>
+          <button data-tab="network" data-icon="globe"><span>Network</span></button>
+          <button data-tab="advanced" data-icon="terminal"><span>Advanced</span></button>
+          <button data-tab="about" data-icon="info"><span>About</span></button>
+        </div>
+        <button id="settings-close" class="icon-btn small plain" title="Close (Esc)" data-icon="x"></button>
+      </header>
+
+      <div class="settings-body">
+        <section data-pane="general">
+          <h3>Downloader Engine</h3>
+          <div class="row"><label>Path</label><code id="engine-path">—</code></div>
+          <div class="row"><label>Version</label><code id="engine-version">—</code></div>
+          <div class="row">
+            <label></label>
+            <button id="check-updates">Check for updates</button>
+          </div>
+
+          <h3>Downloads</h3>
+          <div class="row">
+            <label>Folder</label>
+            <code id="output-dir">—</code>
+            <button id="choose-folder">Choose…</button>
+          </div>
+          <div class="row">
+            <label>Template</label>
+            <input id="output-template" type="text" class="mono" />
+          </div>
+          <div class="row">
+            <label></label>
+            <label class="toggle"><input id="restrict-filenames" type="checkbox" /> Restrict filenames to ASCII</label>
+          </div>
+        </section>
+
+        <section data-pane="cookies" hidden>
+          <p class="hint">Airfetch always sends cookies so logged-in sites work. Pick once here — every browser goes through the Downloader Engine's <code>--cookies-from-browser</code>.</p>
+          <div class="row">
+            <label>Browser</label>
+            <select id="cookies-browser"></select>
+          </div>
+          <div class="row" id="cookies-profile-row">
+            <label>Profile</label>
+            <input id="cookies-profile" type="text" placeholder="Profile name or full path" />
+            <button id="cookies-profile-pick">Choose…</button>
+          </div>
+          <div class="row">
+            <label></label>
+            <button id="rerun-onboarding">Re-run onboarding…</button>
+          </div>
+          <h3>Cookies file (optional)</h3>
+          <div class="row">
+            <label>File</label>
+            <code id="cookies-file">—</code>
+            <button id="cookies-file-clear" hidden>Clear</button>
+            <button id="cookies-file-pick">Choose…</button>
+          </div>
+          <p class="hint">Layered on top of the browser selection. Handy for exported cookies.txt files.</p>
+        </section>
+
+        <section data-pane="format" hidden>
+          <h3>Default mode</h3>
+          <div class="row">
+            <label>Mode</label>
+            <div class="segmented small" id="defaults-mode">
+              <button data-mode="video" class="active" data-icon="film" title="Video"></button>
+              <button data-mode="audio" data-icon="music" title="Audio"></button>
+            </div>
+          </div>
+          <h3>Video</h3>
+          <div class="row"><label>Quality</label><select id="video-quality"></select></div>
+          <div class="row"><label>Container</label><select id="video-container"></select></div>
+          <div class="row"><label>Re-encode</label><select id="recode-format"></select></div>
+          <h3>Audio</h3>
+          <div class="row"><label>Format</label><select id="audio-format"></select></div>
+          <div class="row">
+            <label>Quality</label>
+            <input id="audio-quality" type="number" min="0" max="10" />
+            <span class="hint" id="audio-quality-hint"></span>
+          </div>
+          <h3>Playlist</h3>
+          <div class="row"><label></label>
+            <label class="toggle"><input id="download-playlist" type="checkbox" /> Download whole playlist</label>
+          </div>
+          <div class="row">
+            <label>Items</label>
+            <input id="playlist-items" type="text" placeholder="1-3,7 or -5::" />
+          </div>
+        </section>
+
+        <section data-pane="processing" hidden>
+          <h3>Subtitles</h3>
+          <div class="row"><label></label><label class="toggle"><input id="write-subs" type="checkbox" /> Write subtitle files</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="auto-subs" type="checkbox" /> Include auto-generated</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="embed-subs" type="checkbox" /> Embed into video</label></div>
+          <div class="row"><label>Languages</label><input id="sub-langs" type="text" placeholder="en,en-US,fr" /></div>
+          <h3>Metadata</h3>
+          <div class="row"><label></label><label class="toggle"><input id="embed-thumb" type="checkbox" /> Embed thumbnail</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="embed-meta" type="checkbox" /> Embed metadata</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="embed-chapters" type="checkbox" /> Embed chapter markers</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="sponsorblock" type="checkbox" /> Remove sponsors (SponsorBlock)</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="split-chapters" type="checkbox" /> Split output by chapters</label></div>
+          <h3>Save alongside</h3>
+          <div class="row"><label></label><label class="toggle"><input id="write-thumb" type="checkbox" /> Keep raw thumbnail file</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="write-desc" type="checkbox" /> Save description</label></div>
+          <div class="row"><label></label><label class="toggle"><input id="write-info" type="checkbox" /> Save .info.json</label></div>
+        </section>
+
+        <section data-pane="network" hidden>
+          <h3>User Agent</h3>
+          <textarea id="user-agent" class="mono" rows="3"></textarea>
+          <div class="row button-row">
+            <button id="ua-reset">Reset to default</button>
+            <button id="ua-blank">Blank</button>
+          </div>
+          <h3>Speed &amp; reliability</h3>
+          <div class="row"><label>Concurrent fragments</label><input id="concurrent" type="number" min="1" max="16" /></div>
+          <div class="row"><label>Rate limit</label><input id="rate-limit" type="text" placeholder="4M" /></div>
+          <div class="row"><label>Retries</label><input id="retries" type="number" min="0" max="50" /></div>
+          <div class="row"><label>Proxy</label><input id="proxy" type="text" placeholder="socks5://user:pass@host:port" /></div>
+          <h3>Filters</h3>
+          <div class="row"><label>Min filesize</label><input id="min-size" type="text" placeholder="50M" /></div>
+          <div class="row"><label>Max filesize</label><input id="max-size" type="text" placeholder="500M" /></div>
+          <div class="row"><label>Date after</label><input id="date-after" type="text" placeholder="YYYYMMDD" /></div>
+          <div class="row"><label>Date before</label><input id="date-before" type="text" placeholder="YYYYMMDD" /></div>
+          <div class="row"><label>Age limit</label><input id="age-limit" type="text" /></div>
+          <h3>Time range (clip)</h3>
+          <div class="row"><label>Start</label><input id="limit-start" type="text" placeholder="00:01:30" /></div>
+          <div class="row"><label>End</label><input id="limit-end" type="text" placeholder="00:03:00 or inf" /></div>
+          <p class="hint">Uses <code>--download-sections</code> to download only the specified range.</p>
+        </section>
+
+        <section data-pane="advanced" hidden>
+          <h3>Custom format selector</h3>
+          <input id="custom-format" type="text" class="mono" placeholder="-f expression (overrides mode)" />
+          <p class="hint">Example: <code>bestvideo[height&lt;=1080]+bestaudio/best</code></p>
+          <h3>Extra raw arguments</h3>
+          <textarea id="custom-args" class="mono" rows="4" placeholder="--extractor-args '…'"></textarea>
+          <p class="hint">Appended verbatim to every download; quoted strings respected.</p>
+          <h3>Command preview</h3>
+          <pre id="cmd-preview" class="cmd-preview mono"></pre>
+          <div class="row button-row">
+            <button id="cmd-copy">Copy</button>
+          </div>
+        </section>
+
+        <section data-pane="about" hidden>
+          <div class="about">
+            <div class="big-icon app" data-icon="sparkle"></div>
+            <h1>Airfetch</h1>
+            <p class="hint">Cross-platform Electron port — yt-dlp front-end.</p>
+            <div class="kv"><span>Engine</span><code id="about-engine">—</code></div>
+            <div class="kv"><span>Version</span><code id="about-version">—</code></div>
+            <div class="kv"><span>Data</span><code id="about-data">—</code></div>
+            <div class="kv"><span>Platform</span><code id="about-platform">—</code></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Context menu (history rows) -->
+  <div id="context-menu" class="context-menu" hidden></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
