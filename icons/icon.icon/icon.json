@@ -1,0 +1,52 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "display-p3:1.00000,0.37620,0.46948,1.00000",
+      "display-p3:1.00000,0.89115,0.87469,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "blend-mode" : "normal",
+          "fill-specializations" : [
+            {
+              "value" : {
+                "linear-gradient" : [
+                  "display-p3:0.89894,0.90991,0.89153,1.00000",
+                  "display-p3:1.00000,0.87311,0.73592,1.00000"
+                ]
+              }
+            },
+            {
+              "appearance" : "dark",
+              "value" : {
+                "linear-gradient" : [
+                  "display-p3:0.90991,0.16002,0.00000,1.00000",
+                  "display-p3:1.00000,0.14919,0.69867,1.00000"
+                ]
+              }
+            }
+          ],
+          "image-name" : "Icon Design Request from Recraft.svg",
+          "name" : "Icon Design Request from Recraft"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

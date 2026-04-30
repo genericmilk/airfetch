@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, dialog, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, clipboard, nativeImage } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -10,6 +10,8 @@ const { spawn, spawnSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 
 const VERBOSE = !!process.env.AIRFETCH_DEV;
+
+const APP_ICON_PATH = path.join(__dirname, 'icons', 'dock-icon.png');
 
 // ───────────────────────────────────────────────────────────── logging ─────
 function log(level, msg) {
@@ -23,28 +25,47 @@ const USER_DATA = () => app.getPath('userData');
 const BIN_DIR = () => path.join(USER_DATA(), 'bin');
 const BIN_NAME = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
 const BIN_PATH = () => path.join(BIN_DIR(), BIN_NAME);
+// Sibling file written by the background updater. Swapped over BIN_PATH on the
+// next launch so we never replace the binary while it's in use.
+const BIN_UPGRADE_NAME = process.platform === 'win32' ? 'yt-dlp-upgrade.exe' : 'yt-dlp-upgrade';
+const BIN_UPGRADE_PATH = () => path.join(BIN_DIR(), BIN_UPGRADE_NAME);
 const HISTORY_PATH = () => path.join(USER_DATA(), 'history.json');
 const PREFS_PATH = () => path.join(USER_DATA(), 'prefs.json');
 
-const DEFAULT_USER_AGENT =
+// yt-dlp handles all of these natively via --cookies-from-browser. Each
+// entry also carries a representative user-agent so requests look like
+// they came from the same browser the cookies were lifted from.
+const CHROME_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
+const SAFARI_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ' +
+  '(KHTML, like Gecko) Version/17.6 Safari/605.1.15';
+const FIREFOX_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) ' +
+  'Gecko/20100101 Firefox/128.0';
+const EDGE_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0';
 
-// Matches DownloadOptions.Browser from the Swift app, minus Arc (macOS-only
-// keychain extraction). yt-dlp handles all of these natively via
-// --cookies-from-browser.
 const BROWSERS = [
-  { id: 'none',         label: 'None',          ytdlp: null },
-  { id: 'safari',       label: 'Safari',        ytdlp: 'safari' },
-  { id: 'chrome',       label: 'Chrome',        ytdlp: 'chrome' },
-  { id: 'chromeCanary', label: 'Chrome Canary', ytdlp: 'chrome' },
-  { id: 'firefox',      label: 'Firefox',       ytdlp: 'firefox' },
-  { id: 'edge',         label: 'Edge',          ytdlp: 'edge' },
-  { id: 'brave',        label: 'Brave',         ytdlp: 'brave' },
-  { id: 'chromium',     label: 'Chromium',      ytdlp: 'chromium' },
-  { id: 'opera',        label: 'Opera',         ytdlp: 'opera' },
-  { id: 'vivaldi',      label: 'Vivaldi',       ytdlp: 'vivaldi' },
+  { id: 'none',         label: 'None',          ytdlp: null,       ua: null },
+  { id: 'safari',       label: 'Safari',        ytdlp: 'safari',   ua: SAFARI_UA },
+  { id: 'chrome',       label: 'Chrome',        ytdlp: 'chrome',   ua: CHROME_UA },
+  { id: 'chromeCanary', label: 'Chrome Canary', ytdlp: 'chrome',   ua: CHROME_UA },
+  { id: 'arc',          label: 'Arc',           ytdlp: 'chrome',   ua: CHROME_UA },
+  { id: 'firefox',      label: 'Firefox',       ytdlp: 'firefox',  ua: FIREFOX_UA },
+  { id: 'edge',         label: 'Edge',          ytdlp: 'edge',     ua: EDGE_UA },
+  { id: 'brave',        label: 'Brave',         ytdlp: 'brave',    ua: CHROME_UA },
+  { id: 'chromium',     label: 'Chromium',      ytdlp: 'chromium', ua: CHROME_UA },
+  { id: 'opera',        label: 'Opera',         ytdlp: 'opera',    ua: CHROME_UA },
+  { id: 'vivaldi',      label: 'Vivaldi',       ytdlp: 'vivaldi',  ua: CHROME_UA },
 ];
+
+function userAgentFor(browserId) {
+  const b = BROWSERS.find(x => x.id === browserId);
+  return b ? b.ua : null;
+}
 
 const DEFAULT_OPTIONS = () => ({
   mode: 'video',
@@ -86,7 +107,6 @@ const DEFAULT_OPTIONS = () => ({
   ageLimit: '',
   customFormat: '',
   customArgs: '',
-  userAgent: DEFAULT_USER_AGENT,
 });
 
 const DEFAULT_PREFS = () => ({
@@ -106,14 +126,14 @@ function buildArguments(opts, urls) {
   // pipe-split parser and shift every following field by one.
   args.push('--progress-template',
     'download:[AFPROG]%(progress.status)s\x1f%(progress._percent_str)s\x1f%(progress._eta_str)s\x1f%(progress._speed_str)s\x1f%(progress._downloaded_bytes_str)s\x1f%(progress._total_bytes_str)s\x1f%(info.id)s\x1f%(info.title)s');
-  args.push('--print', 'video:[AFMETA]%(id)s\x1f%(title)s\x1f%(duration)s\x1f%(uploader)s\x1f%(thumbnail)s\x1f%(webpage_url)s');
-  args.push('--print', 'after_move:[AFFILE]%(filepath)s');
+  args.push('--print', 'video:[AFMETA]%(id)s\x1f%(title)s\x1f%(duration)s\x1f%(uploader)s\x1f%(thumbnail)s\x1f%(webpage_url)s\x1f%(playlist_index)s\x1f%(playlist_count)s');
+  args.push('--print', 'after_move:[AFFILE]%(id)s\x1f%(filepath)s');
 
   if (opts.outputDirectory) args.push('-P', opts.outputDirectory);
   args.push('-o', opts.outputTemplate || '%(title)s [%(id)s].%(ext)s');
   if (opts.restrictFilenames) args.push('--restrict-filenames');
 
-  const ua = (opts.userAgent || '').trim();
+  const ua = userAgentFor(opts.cookiesFromBrowser);
   if (ua) args.push('--user-agent', ua);
 
   const heightLimits = {
@@ -161,7 +181,16 @@ function buildArguments(opts, urls) {
   }
   if (opts.embedSubtitles) args.push('--embed-subs');
 
-  if (opts.embedThumbnail) args.push('--embed-thumbnail');
+  if (opts.embedThumbnail) {
+    args.push('--embed-thumbnail');
+    // YouTube serves webp/avif thumbnails which ffmpeg can't reliably
+    // mux into mp4/m4a — postprocessing dies with
+    //   "Postprocessing: Error opening output files: Invalid argument"
+    // even though the video itself downloaded fine. Forcing the
+    // thumbnail to jpg before the embed step keeps it inside the set
+    // every container actually supports.
+    args.push('--convert-thumbnails', 'jpg');
+  }
   if (opts.embedMetadata) args.push('--embed-metadata');
   if (opts.embedChapters) args.push('--embed-chapters');
   if (opts.sponsorBlockRemove) args.push('--sponsorblock-remove', 'sponsor,selfpromo,interaction');
@@ -177,6 +206,9 @@ function buildArguments(opts, urls) {
     if (profile) spec += `:${profile}`;
     else if (opts.cookiesFromBrowser === 'chromeCanary') {
       spec += `:${path.join(os.homedir(), 'Library/Application Support/Google/Chrome Canary/Default')}`;
+    }
+    else if (opts.cookiesFromBrowser === 'arc') {
+      spec += `:${path.join(os.homedir(), 'Library/Application Support/Arc/User Data/Default')}`;
     }
     args.push('--cookies-from-browser', spec);
   }
@@ -265,12 +297,21 @@ function locateYtdlp() {
   return null;
 }
 
+// Async — spawnSync blocks the Node event loop, which means IPC stalls and
+// the renderer's window freezes for the duration of a `yt-dlp --version`
+// call (1–3 s for the macOS PyInstaller bundle).
 function probeVersion(binPath) {
-  try {
-    const r = spawnSync(binPath, ['--version'], { encoding: 'utf8' });
-    if (r.status === 0) return (r.stdout || '').trim();
-  } catch { /* ignore */ }
-  return '';
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(binPath, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      child.stdout.on('data', d => { out += d.toString(); });
+      child.on('error', () => resolve(''));
+      child.on('close', code => resolve(code === 0 ? out.trim() : ''));
+    } catch {
+      resolve('');
+    }
+  });
 }
 
 // ────────────────────────────────────────────────── yt-dlp installer ──────
@@ -346,7 +387,102 @@ async function installYtdlp(onProgress) {
       try { spawnSync('/usr/bin/xattr', ['-c', dest]); } catch { /* ignore */ }
     }
   }
+  // A successful manual install supersedes any background-staged upgrade.
+  try { await fsp.unlink(BIN_UPGRADE_PATH()); } catch { /* ok */ }
   return { path: dest, tag };
+}
+
+// yt-dlp uses calendar versioning ("YYYY.MM.DD" or "YYYY.MM.DD.PATCH"), so
+// numeric-component compare works across formats.
+function compareVersions(a, b) {
+  const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const da = pa[i] || 0, db = pb[i] || 0;
+    if (da !== db) return da < db ? -1 : 1;
+  }
+  return 0;
+}
+
+// Run on every launch (after a managed install exists). If a previous session
+// staged a newer binary at BIN_UPGRADE_PATH, atomically replace BIN_PATH with
+// it; otherwise discard a stale or older stage.
+async function applyStagedUpgrade() {
+  const staged = BIN_UPGRADE_PATH();
+  if (!fs.existsSync(staged)) {
+    log('info', 'yt-dlp updater: no staged upgrade waiting');
+    return;
+  }
+  const dest = BIN_PATH();
+  try {
+    if (fs.existsSync(dest)) {
+      const current = await probeVersion(dest);
+      const next = await probeVersion(staged);
+      if (next && current && compareVersions(next, current) <= 0) {
+        log('info', `yt-dlp updater: discarding stale stage (staged=${next} ≤ current=${current})`);
+        fs.unlinkSync(staged);
+        return;
+      }
+      log('info', `yt-dlp updater: applying staged upgrade ${current || '?'} → ${next || '?'}`);
+    } else {
+      log('info', 'yt-dlp updater: applying staged binary (no live binary present)');
+    }
+    // Replace the live binary. rename() across the same directory is atomic
+    // on POSIX; Windows can't replace an open file, but the staged-on-startup
+    // ordering means nothing is using it yet.
+    try { fs.unlinkSync(dest); } catch { /* ok */ }
+    fs.renameSync(staged, dest);
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(dest, 0o755); } catch { /* ignore */ }
+      if (process.platform === 'darwin') {
+        try { spawnSync('/usr/bin/xattr', ['-c', dest]); } catch { /* ignore */ }
+      }
+    }
+    log('info', `yt-dlp updater: swap complete → ${dest}`);
+  } catch (err) {
+    log('error', `yt-dlp updater: applyStagedUpgrade failed: ${err.message}`);
+    try { fs.unlinkSync(staged); } catch { /* ignore */ }
+  }
+}
+
+// Quietly download the latest release into BIN_UPGRADE_PATH if newer than the
+// running binary. Never throws; failures are swallowed (no network, GH rate
+// limit, etc.). The actual swap happens on the *next* launch via
+// applyStagedUpgrade().
+async function stageBackgroundUpgrade(currentVersion) {
+  log('info', `yt-dlp updater: querying GitHub for latest release (current=${currentVersion || 'unknown'})`);
+  const release = await fetchJSON('https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest');
+  const tag = release.tag_name;
+  if (!tag) {
+    log('info', 'yt-dlp updater: GitHub returned no tag_name');
+    return null;
+  }
+  if (currentVersion && compareVersions(tag, currentVersion) <= 0) {
+    log('info', `yt-dlp updater: already up to date (current=${currentVersion}, latest=${tag})`);
+    return null;
+  }
+  const asset = (release.assets || []).find(a => a.name === pickAssetName());
+  if (!asset) {
+    log('info', `yt-dlp updater: release ${tag} has no asset for ${pickAssetName()}`);
+    return null;
+  }
+
+  log('info', `yt-dlp updater: downloading ${tag} (${asset.name}) for next-launch swap`);
+  await fsp.mkdir(BIN_DIR(), { recursive: true });
+  const tmp = path.join(os.tmpdir(), `airfetch-ytdlp-${randomUUID()}`);
+  await downloadTo(asset.browser_download_url, tmp);
+  const staged = BIN_UPGRADE_PATH();
+  try { await fsp.unlink(staged); } catch { /* ok */ }
+  await fsp.rename(tmp, staged);
+  if (process.platform !== 'win32') {
+    try { await fsp.chmod(staged, 0o755); } catch { /* ignore */ }
+    if (process.platform === 'darwin') {
+      try { spawnSync('/usr/bin/xattr', ['-c', staged]); } catch { /* ignore */ }
+    }
+  }
+  log('info', `yt-dlp updater: staged ${tag} at ${staged}`);
+  return tag;
 }
 
 // ──────────────────────────────────────────────────── download manager ────
@@ -359,8 +495,11 @@ class Manager {
     this.history = loadJSON(HISTORY_PATH(), []);
     this.jobs = [];
     this.runs = new Map();  // jobId → { child, lastStderr }
-    this.ytdlpPath = locateYtdlp();
-    this.ytdlpVersion = this.ytdlpPath ? probeVersion(this.ytdlpPath) : '';
+    // Probing yt-dlp synchronously here would block the window from painting
+    // — `yt-dlp_macos --version` is a PyInstaller bundle that costs 1–3 s to
+    // launch. Resolved lazily after the renderer is up via resolveYtdlp().
+    this.ytdlpPath = null;
+    this.ytdlpVersion = '';
     this.launchError = null;
     this.upgradeState = { status: 'idle', progress: 0, output: '', lastTag: '' };
     this.win = null;
@@ -368,6 +507,11 @@ class Manager {
   }
 
   attach(win) { this.win = win; }
+
+  async resolveYtdlp() {
+    this.ytdlpPath = locateYtdlp();
+    this.ytdlpVersion = this.ytdlpPath ? await probeVersion(this.ytdlpPath) : '';
+  }
 
   ensureOutputDir() {
     const dir = this.prefs.defaults.outputDirectory;
@@ -449,6 +593,13 @@ class Manager {
       finishedAt: null,
       lastLog: '',
       errorMessage: null,
+      // Playlist mode: yt-dlp emits one [AFMETA]/[AFPROG]/[AFFILE] cycle per
+      // entry. We record each completed entry so the row can show "N of M"
+      // and each finished video lands as its own history item.
+      isPlaylist: false,
+      playlistIndex: 0,
+      playlistCount: 0,
+      completedEntries: [],
     };
     this.jobs.unshift(job);
     this.launchProcess(job, opts);
@@ -558,9 +709,15 @@ class Manager {
     const job = this.jobs[idx];
     if (!isTerminal(job.status)) return;
     this.jobs.splice(idx, 1);
-    const item = historyItemFrom(job);
-    this.history = this.history.filter(h => h.id !== item.id);
-    this.history.unshift(item);
+    // The current entry (which hasn't been archived yet) becomes the final
+    // history item. For non-playlist jobs this is just the single download;
+    // for playlists, archivePlaylistEntry has already filed the earlier
+    // entries — this one rounds out the set.
+    if (job.filePath || !job.isPlaylist || job.completedEntries.length === 0) {
+      const item = historyItemFrom(job);
+      this.history = this.history.filter(h => h.id !== item.id);
+      this.history.unshift(item);
+    }
     this.saveHistory();
   }
 
@@ -586,18 +743,62 @@ class Manager {
     } else if (line.startsWith('[AFMETA]')) {
       const p = line.slice('[AFMETA]'.length).split('\x1f');
       if (p.length >= 6) {
+        const id = (p[0] && p[0] !== 'NA') ? p[0] : '';
+        // A new id while we already have one means yt-dlp moved on to the
+        // next playlist entry — snapshot the prior entry into history so
+        // each video shows up as its own row.
+        if (id && job.videoID && id !== job.videoID && job.filePath) {
+          this.archivePlaylistEntry(job);
+        }
         if (p[1] && p[1] !== 'NA') job.title = p[1];
         if (p[3] && p[3] !== 'NA') job.uploader = p[3];
-        if (p[0] && p[0] !== 'NA') job.videoID = p[0];
+        if (id) job.videoID = id;
         if (p[4] && p[4] !== 'NA') job.thumbnailURL = p[4];
+        const idx = parseInt(p[6], 10);
+        const total = parseInt(p[7], 10);
+        if (Number.isFinite(idx) && idx >= 1) {
+          job.isPlaylist = true;
+          job.playlistIndex = idx;
+          if (Number.isFinite(total) && total > 0) job.playlistCount = total;
+        }
+        // Reset per-entry progress so the row doesn't briefly show the
+        // previous video's completed state while the next one is still
+        // being resolved.
+        job.percent = 0;
+        job.filePath = null;
       }
     } else if (line.startsWith('[AFFILE]')) {
-      const filePath = line.slice('[AFFILE]'.length).trim();
+      const rest = line.slice('[AFFILE]'.length);
+      const sep = rest.indexOf('\x1f');
+      const filePath = sep >= 0 ? rest.slice(sep + 1).trim() : rest.trim();
       if (filePath) job.filePath = filePath;
     } else {
       job.lastLog = line;
     }
     this.broadcast();
+  }
+
+  // Capture a finished playlist entry as a history item *before* yt-dlp
+  // overwrites the job fields with the next entry's metadata.
+  archivePlaylistEntry(job) {
+    const entry = {
+      id: randomUUID(),
+      url: job.url,
+      title: job.title,
+      uploader: job.uploader,
+      videoID: job.videoID,
+      thumbnailURL: job.thumbnailURL,
+      filePath: job.filePath,
+      completedAt: new Date().toISOString(),
+      mode: job.options.mode,
+      status: 'finished',
+      errorMessage: null,
+      fileSizeBytes: filePathSize(job.filePath),
+    };
+    job.completedEntries.push(entry);
+    this.history = this.history.filter(h => h.id !== entry.id);
+    this.history.unshift(entry);
+    this.saveHistory();
   }
 
   onStderr(jobId, raw) {
@@ -610,11 +811,20 @@ class Manager {
     }
     const job = this.jobs.find(j => j.id === jobId);
     if (!job) return;
+    log('info', `job=${jobId.slice(0, 8)} stderr ${line}`);
+    // yt-dlp emits a steady stream of non-fatal cookie/extractor warnings
+    // even on perfectly successful downloads (e.g. "failed to decrypt
+    // cookie (AES-CBC)" when a browser jar contains entries we can't
+    // read). They aren't actionable for the user and shouldn't bleed
+    // into the row subline or the error banner.
+    if (isBenignYtDlpNoise(line)) {
+      this.broadcast();
+      return;
+    }
     job.lastLog = line;
     if (line.toLowerCase().includes('error') && !job.errorMessage) {
       job.errorMessage = line;
     }
-    log('info', `job=${jobId.slice(0, 8)} stderr ${line}`);
     this.broadcast();
   }
 
@@ -634,8 +844,23 @@ class Manager {
       job.status = 'finished';
       job.percent = 100;
     } else if (job.status !== 'cancelled') {
-      job.status = 'failed';
-      if (!job.errorMessage) job.errorMessage = `Downloader Engine exited with code ${code}`;
+      // A non-zero exit from a postprocessor (embed thumbnail, embed
+      // metadata, sponsor block, …) often leaves the actual video on
+      // disk — yt-dlp printed the after-move filepath before bailing,
+      // or the downloaded file is still sitting in the output dir.
+      // In that case we don't want the row to read as "failed" when
+      // the user already has a working file.
+      const recovered = recoverFinishedFile(job);
+      if (recovered) {
+        job.filePath = recovered;
+        job.status = 'finished';
+        job.percent = 100;
+        if (!job.lastLog) job.lastLog = 'Finished with postprocessing warning';
+        job.errorMessage = null;
+      } else {
+        job.status = 'failed';
+        if (!job.errorMessage) job.errorMessage = `Downloader Engine exited with code ${code}`;
+      }
     }
     log('info', `job=${jobId.slice(0, 8)} exit=${code} status=${job.status}`);
     this.moveToHistory(jobId);
@@ -654,7 +879,7 @@ class Manager {
         this.broadcast();
       });
       this.ytdlpPath = p;
-      this.ytdlpVersion = probeVersion(p);
+      this.ytdlpVersion = await probeVersion(p);
       this.upgradeState = { status: 'success', progress: 1, output: `Installed ${tag}`, lastTag: tag };
       log('info', `yt-dlp install OK tag=${tag} path=${p}`);
       this.broadcast();
@@ -670,6 +895,27 @@ class Manager {
   resetUpgradeState() {
     this.upgradeState = { status: 'idle', progress: 0, output: '', lastTag: '' };
     this.broadcast();
+  }
+
+  // Best-effort: ask GitHub for the newest yt-dlp and stage it next to the
+  // live binary so the *next* launch swaps it in. No-op when the user is
+  // already running a manual install, no managed binary exists yet (first
+  // run — the onboarding install will handle it), or the network call fails.
+  async backgroundUpdateCheck() {
+    if (this.upgradeState.status === 'running') {
+      log('info', 'yt-dlp updater: skipping background check (manual install in progress)');
+      return;
+    }
+    if (!this.ytdlpPath || !fs.existsSync(BIN_PATH())) {
+      log('info', 'yt-dlp updater: skipping background check (no managed binary — first run)');
+      return;
+    }
+    try {
+      const tag = await stageBackgroundUpgrade(this.ytdlpVersion);
+      if (tag) log('info', `yt-dlp updater: ${tag} staged for next launch`);
+    } catch (err) {
+      log('error', `yt-dlp updater: background check failed: ${err.message}`);
+    }
   }
 }
 
@@ -688,11 +934,53 @@ function parsePercent(s) {
 function isTerminal(status) {
   return status === 'finished' || status === 'failed' || status === 'cancelled';
 }
-function historyItemFrom(job) {
-  let size = null;
-  if (job.filePath) {
-    try { size = fs.statSync(job.filePath).size; } catch { /* ignore */ }
+function filePathSize(filePath) {
+  if (!filePath) return null;
+  try { return fs.statSync(filePath).size; } catch { return null; }
+}
+
+// Look for the actual downloaded file when yt-dlp exited non-zero. If
+// after_move printed a filepath we trust it; otherwise scan the output
+// directory for a recent file matching the video id (yt-dlp embeds
+// "[<id>]" in the default template) and treat that as the final file.
+function recoverFinishedFile(job) {
+  if (job.filePath && fs.existsSync(job.filePath)) return job.filePath;
+  const dir = job.options?.outputDirectory;
+  const id = job.videoID;
+  if (!dir || !id) return null;
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch { return null; }
+  // Skip yt-dlp's intermediate scratch files.
+  const SKIP = /\.(part|ytdl|temp|frag\d*|webp|jpg|jpeg|png|description|info\.json|en\.vtt|live_chat\.json)$/i;
+  let best = null;
+  let bestMtime = 0;
+  for (const name of entries) {
+    if (!name.includes(`[${id}]`)) continue;
+    if (SKIP.test(name)) continue;
+    const full = path.join(dir, name);
+    let st;
+    try { st = fs.statSync(full); } catch { continue; }
+    if (!st.isFile() || st.size === 0) continue;
+    if (st.mtimeMs > bestMtime) { best = full; bestMtime = st.mtimeMs; }
   }
+  return best;
+}
+
+// stderr lines we suppress from the UI. The download still continues and
+// finishes cleanly when these appear, so surfacing them as "lastLog" or
+// "errorMessage" makes a successful job look broken.
+const BENIGN_NOISE_PATTERNS = [
+  /failed to decrypt cookie/i,
+  /UTF-8 decoding failed/i,
+  /Possibly the key is wrong/i,
+  /could not find .* cookies database/i,
+  /Deleting existing file/i,
+];
+function isBenignYtDlpNoise(line) {
+  return BENIGN_NOISE_PATTERNS.some(re => re.test(line));
+}
+function historyItemFrom(job) {
+  const size = filePathSize(job.filePath);
   return {
     id: job.id,
     url: job.url,
@@ -741,6 +1029,7 @@ function createWindow() {
     minWidth: 820,
     minHeight: 520,
     title: 'Airfetch',
+    icon: !isMac && fs.existsSync(APP_ICON_PATH) ? APP_ICON_PATH : undefined,
     titleBarStyle: isMac ? 'hidden' : 'default',
     trafficLightPosition: isMac ? trafficLight : undefined,
     // On macOS, use a translucent window material so whatever is behind
@@ -763,17 +1052,37 @@ function createWindow() {
     apply();
     win.webContents.on('did-finish-load', apply);
   }
-  win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-  if (VERBOSE) win.webContents.openDevTools({ mode: 'detach' });
+  // Renderer is built by Vite to renderer/dist; npm run start handles the
+  // build before electron launches.
+  win.loadFile(path.join(__dirname, 'renderer', 'dist', 'index.html'));
+  if (VERBOSE) {
+    win.webContents.openDevTools({ mode: 'detach' });
+    win.webContents.on('console-message', (_e, level, message, line, source) => {
+      const levels = ['debug', 'info', 'warn', 'error'];
+      const prefix = levels[level] || 'log';
+      log('info', `renderer[${prefix}] ${source}:${line} ${message}`);
+    });
+  }
   return win;
 }
 
 app.whenReady().then(() => {
+  if (process.platform === 'darwin' && app.dock && fs.existsSync(APP_ICON_PATH)) {
+    try { app.dock.setIcon(nativeImage.createFromPath(APP_ICON_PATH)); } catch { /* ignore */ }
+  }
   manager = new Manager();
   const win = createWindow();
   manager.attach(win);
-  // Send initial state after the renderer finishes loading.
-  win.webContents.on('did-finish-load', () => manager.broadcast());
+  // Paint the window first, then do the slow yt-dlp work. applyStagedUpgrade
+  // and probeVersion both spawn the yt-dlp binary synchronously (~1–3 s on
+  // macOS PyInstaller bundles), which used to stall first paint by 10 s+.
+  win.webContents.on('did-finish-load', async () => {
+    manager.broadcast();
+    await applyStagedUpgrade();
+    await manager.resolveYtdlp();
+    manager.broadcast();
+    manager.backgroundUpdateCheck();
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
