@@ -1,8 +1,8 @@
 {
-  "name": "airfetch-electron",
+  "name": "airfetch",
   "productName": "Airfetch",
   "version": "0.1.0",
-  "description": "Cross-platform Electron port of Airfetch — a yt-dlp front-end.",
+  "description": "Cross-platform video & audio downloader.",
   "main": "main.js",
   "private": true,
   "author": "Peter Day",
@@ -81,7 +81,7 @@
         }
       ],
       "icon": "build/icon.png",
-      "synopsis": "yt-dlp front-end",
+      "synopsis": "Video & audio downloader",
       "maintainer": "Peter Day"
     },
     "win": {
