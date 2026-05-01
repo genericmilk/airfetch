@@ -201,7 +201,15 @@ function buildArguments(opts, urls) {
   if (opts.writeInfoJSON) args.push('--write-info-json');
 
   const browser = BROWSERS.find(b => b.id === opts.cookiesFromBrowser);
-  if (browser && browser.ytdlp) {
+  // Arc on macOS encrypts its cookies with a key stored under the
+  // "Arc Safe Storage" Keychain entry, but yt-dlp's --cookies-from-browser
+  // only knows how to look up Chromium's "Chrome Safe Storage" — so every
+  // cookie fails to decrypt and the request goes out as if logged-out.
+  // Manager.start() decrypts Arc's cookie jar ahead of time and stashes the
+  // resulting Netscape file path on opts; we feed that via --cookies instead.
+  if (opts.cookiesFromBrowser === 'arc' && opts._arcCookiesFile) {
+    args.push('--cookies', opts._arcCookiesFile);
+  } else if (browser && browser.ytdlp) {
     let spec = browser.ytdlp;
     const profile = (opts.cookiesBrowserProfile || '').trim();
     if (profile) spec += `:${profile}`;
@@ -209,7 +217,10 @@ function buildArguments(opts, urls) {
       spec += `:${path.join(os.homedir(), 'Library/Application Support/Google/Chrome Canary/Default')}`;
     }
     else if (opts.cookiesFromBrowser === 'arc') {
-      spec += `:${path.join(os.homedir(), 'Library/Application Support/Arc/User Data/Default')}`;
+      // Fallback when the keychain export couldn't run (non-darwin or
+      // Keychain access denied). Better than nothing, but the cookies will
+      // still come out garbled — we surface the export failure separately.
+      spec += `:${pickArcProfileDir(opts.cookiesBrowserProfile) || path.join(os.homedir(), 'Library/Application Support/Arc/User Data/Default')}`;
     }
     args.push('--cookies-from-browser', spec);
   }
@@ -502,6 +513,177 @@ async function stageBackgroundUpgrade(currentVersion) {
   return tag;
 }
 
+// ─────────────────────────────────────────────────────── arc cookies ──────
+// yt-dlp doesn't natively support Arc and treats `--cookies-from-browser arc:…`
+// as Chrome — so it queries the wrong macOS Keychain entry ("Chrome Safe
+// Storage" instead of "Arc Safe Storage"), the AES-CBC decrypt fails for
+// every cookie, and the request goes out logged-out. We work around this by
+// reading Arc's cookie jar ourselves, decrypting with the right key, and
+// writing a Netscape cookies.txt that yt-dlp can ingest via --cookies.
+const ARC_USER_DATA = () =>
+  path.join(os.homedir(), 'Library/Application Support/Arc/User Data');
+const ARC_KEYCHAIN_SERVICE = 'Arc Safe Storage';
+const PBKDF2_SALT = 'saltysalt';
+const PBKDF2_ITER = 1003;
+const AES_KEY_LEN = 16;
+// Chromium uses an IV of 16 spaces for cookie encryption on macOS/Linux.
+const CHROMIUM_IV = Buffer.alloc(16, 0x20);
+
+// Picks the Arc profile directory to read cookies from. Honors a user-
+// supplied profile name (or absolute path) and otherwise auto-selects the
+// profile whose Cookies file was most recently written — that's the one the
+// user most recently used. Arc's "Spaces" feature creates additional
+// profiles ("Profile 1", "Profile 2", …) alongside the original "Default";
+// without auto-detection we'd silently pull from an empty Default for
+// anyone who's used Spaces.
+function pickArcProfileDir(profileHint) {
+  const base = ARC_USER_DATA();
+  const trimmed = (profileHint || '').trim();
+  if (trimmed) return path.isAbsolute(trimmed) ? trimmed : path.join(base, trimmed);
+  let entries;
+  try { entries = fs.readdirSync(base, { withFileTypes: true }); } catch { return null; }
+  let best = null;
+  let bestMtime = 0;
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    if (e.name !== 'Default' && !/^Profile \d+$/.test(e.name)) continue;
+    const cookiesPath = path.join(base, e.name, 'Cookies');
+    let st;
+    try { st = fs.statSync(cookiesPath); } catch { continue; }
+    if (st.mtimeMs > bestMtime) { best = path.join(base, e.name); bestMtime = st.mtimeMs; }
+  }
+  return best;
+}
+
+function getArcAesKey() {
+  const res = spawnSync(
+    '/usr/bin/security',
+    ['find-generic-password', '-w', '-s', ARC_KEYCHAIN_SERVICE],
+    { encoding: 'utf8' },
+  );
+  if (res.status !== 0 || !res.stdout) {
+    throw new Error('Arc Safe Storage password not found in macOS Keychain');
+  }
+  const password = res.stdout.replace(/[\r\n]+$/, '');
+  return require('node:crypto').pbkdf2Sync(
+    password, PBKDF2_SALT, PBKDF2_ITER, AES_KEY_LEN, 'sha1',
+  );
+}
+
+function decryptArcCookieValue(key, hex) {
+  if (!hex) return '';
+  const buf = Buffer.from(hex, 'hex');
+  if (buf.length === 0) return '';
+  const version = buf.slice(0, 3).toString('latin1');
+  if (version !== 'v10' && version !== 'v11') return buf.toString('utf8');
+  const ct = buf.slice(3);
+  if (ct.length === 0 || ct.length % 16 !== 0) return null;
+  const decipher = require('node:crypto').createDecipheriv('aes-128-cbc', key, CHROMIUM_IV);
+  let pt;
+  try { pt = Buffer.concat([decipher.update(ct), decipher.final()]); }
+  catch { return null; }
+  // Chromium 130+ on macOS prefixes the plaintext with a 32-byte SHA-256 of
+  // (host || name) before the cookie value. There's no version marker for
+  // it — Chromium just bumped the format under the same `v10`/`v11` prefix.
+  // Detect by inspection: a binary head followed by a printable tail means
+  // strip the head.
+  if (pt.length > 32) {
+    let headBinary = false;
+    for (let i = 0; i < 32; i++) {
+      const b = pt[i];
+      if (b < 0x20 || b > 0x7e) { headBinary = true; break; }
+    }
+    if (headBinary) {
+      let tailPrintable = true;
+      for (let i = 32; i < pt.length; i++) {
+        const b = pt[i];
+        if (b < 0x09 || (b > 0x0d && b < 0x20) || b > 0x7e) { tailPrintable = false; break; }
+      }
+      if (tailPrintable) return pt.slice(32).toString('utf8');
+    }
+  }
+  return pt.toString('utf8');
+}
+
+// Decrypts every cookie in the chosen Arc profile and writes a Netscape
+// cookies.txt to the system tmpdir. Returns the absolute path. Caller owns
+// cleanup via cleanupArcCookieFile().
+function exportArcCookies(profileHint) {
+  const profileDir = pickArcProfileDir(profileHint);
+  if (!profileDir) throw new Error('No Arc profile directory found');
+  const cookiesDb = path.join(profileDir, 'Cookies');
+  if (!fs.existsSync(cookiesDb)) throw new Error(`Arc cookies database missing: ${cookiesDb}`);
+  const key = getArcAesKey();
+
+  // VACUUM INTO produces a consistent snapshot even when Arc has the live DB
+  // open with WAL pages outstanding. A plain copy can miss recent writes.
+  const tmpDb = path.join(os.tmpdir(), `airfetch-arc-${randomUUID()}.db`);
+  const vac = spawnSync(
+    '/usr/bin/sqlite3',
+    [cookiesDb, `VACUUM INTO '${tmpDb.replace(/'/g, "''")}'`],
+    { encoding: 'utf8' },
+  );
+  if (vac.status !== 0) {
+    // Fallback: best-effort copy. Less correct but better than failing.
+    try { fs.copyFileSync(cookiesDb, tmpDb); }
+    catch (err) { throw new Error(`Cannot snapshot Arc cookies DB: ${vac.stderr || err.message}`); }
+  }
+
+  const sql = 'SELECT host_key, path, is_secure, expires_utc, name, hex(encrypted_value), is_httponly FROM cookies;';
+  const sq = spawnSync(
+    '/usr/bin/sqlite3', ['-separator', '\t', tmpDb, sql],
+    { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 },
+  );
+  try { fs.unlinkSync(tmpDb); } catch { /* ok */ }
+  if (sq.status !== 0) throw new Error(`sqlite3 read failed: ${sq.stderr || 'unknown'}`);
+
+  const lines = ['# Netscape HTTP Cookie File', '# Generated by Airfetch', ''];
+  let total = 0, ok = 0;
+  for (const row of sq.stdout.split('\n')) {
+    if (!row) continue;
+    total++;
+    const parts = row.split('\t');
+    if (parts.length < 7) continue;
+    const [host, ckPath, isSec, expires, name, hex, httponly] = parts;
+    if (!host || !name) continue;
+    const value = decryptArcCookieValue(key, hex);
+    // null = decrypt failed; skip silently. Empty string is a legitimate
+    // cookie value (e.g. session-clear) so we keep it.
+    if (value === null) continue;
+    if (/[\t\r\n]/.test(value)) continue;
+    ok++;
+    // Chromium stores expires_utc as microseconds since 1601-01-01;
+    // Netscape wants seconds since 1970. 11644473600 = seconds between.
+    const exp = expires === '0'
+      ? '0'
+      : Math.max(0, Math.floor(Number(expires) / 1_000_000 - 11644473600));
+    const flag = host.startsWith('.') ? 'TRUE' : 'FALSE';
+    const secure = isSec === '1' ? 'TRUE' : 'FALSE';
+    const prefix = httponly === '1' ? '#HttpOnly_' : '';
+    lines.push([prefix + host, flag, ckPath || '/', secure, exp, name, value].join('\t'));
+  }
+  log('info', `Arc cookies export: ${ok}/${total} from ${path.basename(profileDir)}`);
+  const outPath = path.join(os.tmpdir(), `airfetch-arc-cookies-${randomUUID()}.txt`);
+  fs.writeFileSync(outPath, lines.join('\n') + '\n', { mode: 0o600 });
+  return outPath;
+}
+
+function cleanupArcCookieFile(p) {
+  if (!p) return;
+  try { fs.unlinkSync(p); } catch { /* ok */ }
+}
+
+// Sweep stale Arc-cookie temp files left behind by prior crashes. Runs once
+// at startup so /tmp doesn't accumulate decrypted cookie jars across runs.
+function cleanupOrphanedArcCookieFiles() {
+  let entries;
+  try { entries = fs.readdirSync(os.tmpdir()); } catch { return; }
+  for (const name of entries) {
+    if (!/^airfetch-arc-(cookies-.*\.txt|.*\.db)$/.test(name)) continue;
+    try { fs.unlinkSync(path.join(os.tmpdir(), name)); } catch { /* ok */ }
+  }
+}
+
 // ──────────────────────────────────────────────────── download manager ────
 class Manager {
   constructor() {
@@ -627,6 +809,7 @@ class Manager {
       startedAt: new Date().toISOString(),
       finishedAt: null,
       lastLog: '',
+      logLines: [],
       errorMessage: null,
       // Playlist mode: yt-dlp emits one [AFMETA]/[AFPROG]/[AFFILE] cycle per
       // entry. We record each completed entry so the row can show "N of M"
@@ -643,6 +826,19 @@ class Manager {
   }
 
   launchProcess(job, opts) {
+    // Re-export Arc cookies on every spawn (initial start + resume) so the
+    // freshest session jar lands in the temp file. Discard any prior export
+    // first; cookies may have rotated while the job was paused.
+    if (opts.cookiesFromBrowser === 'arc' && process.platform === 'darwin') {
+      cleanupArcCookieFile(opts._arcCookiesFile);
+      opts._arcCookiesFile = null;
+      try {
+        opts._arcCookiesFile = exportArcCookies(opts.cookiesBrowserProfile);
+      } catch (err) {
+        log('error', `Arc cookies export failed: ${err.message}`);
+        job.lastLog = `Arc cookies unavailable: ${err.message}`;
+      }
+    }
     const args = ['--color', 'never', ...buildArguments(opts, [job.url])];
     log('info', `spawn job=${job.id.slice(0, 8)} args=${args.length}`);
     const env = { ...process.env };
@@ -675,6 +871,11 @@ class Manager {
       job.status = 'cancelled';
       job.finishedAt = new Date().toISOString();
       job.errorMessage = 'Cancelled by user';
+      // moveToHistory removes the job from this.jobs, so onExit's lookup
+      // returns undefined and its cleanup branch never runs. Clean up the
+      // Arc cookies temp file here instead.
+      cleanupArcCookieFile(job.options._arcCookiesFile);
+      job.options._arcCookiesFile = null;
       this.moveToHistory(jobId);
     }
     this.broadcast();
@@ -718,7 +919,10 @@ class Manager {
 
   retry(historyId) {
     const item = this.history.find(h => h.id === historyId);
-    if (item) this.start(item.url);
+    if (!item) return;
+    this.history = this.history.filter(h => h.id !== historyId);
+    this.saveHistory();
+    this.start(item.url);
   }
 
   removeHistory(id) {
@@ -809,6 +1013,7 @@ class Manager {
       if (filePath) job.filePath = filePath;
     } else {
       job.lastLog = line;
+      appendLogLine(job, line);
     }
     this.broadcast();
   }
@@ -848,6 +1053,7 @@ class Manager {
     const job = this.jobs.find(j => j.id === jobId);
     if (!job) return;
     log('info', `job=${jobId.slice(0, 8)} stderr ${line}`);
+    appendLogLine(job, line);
     // yt-dlp emits a steady stream of non-fatal cookie/extractor warnings
     // even on perfectly successful downloads (e.g. "failed to decrypt
     // cookie (AES-CBC)" when a browser jar contains entries we can't
@@ -857,9 +1063,14 @@ class Manager {
       this.broadcast();
       return;
     }
-    job.lastLog = line;
-    if (line.toLowerCase().includes('error') && !job.errorMessage) {
-      job.errorMessage = line;
+    const clean = sanitizeEngineMessage(line);
+    if (!clean) {
+      this.broadcast();
+      return;
+    }
+    job.lastLog = clean;
+    if (clean.toLowerCase().includes('error') && !job.errorMessage) {
+      job.errorMessage = clean;
     }
     this.broadcast();
   }
@@ -899,6 +1110,11 @@ class Manager {
       }
     }
     log('info', `job=${jobId.slice(0, 8)} exit=${code} status=${job.status}`);
+    // Decrypted Arc cookies were written to a temp file just for this run;
+    // remove it now that the job has reached a terminal state. (Pause is
+    // handled by the early return above so the file survives a resume.)
+    cleanupArcCookieFile(job.options._arcCookiesFile);
+    job.options._arcCookiesFile = null;
     // Skip when the playlist path already fired per-entry notifications;
     // those handle the success cases. The container exit only matters
     // here for failure notifications.
@@ -1141,6 +1357,19 @@ const BENIGN_NOISE_PATTERNS = [
 function isBenignYtDlpNoise(line) {
   return BENIGN_NOISE_PATTERNS.some(re => re.test(line));
 }
+// Strip user-facing yt-dlp branding from log/error lines before they hit
+// the renderer. The "please report this issue on …/yt-dlp/issues" hint is
+// also misdirection (we maintain Airfetch, not yt-dlp), so we drop it
+// rather than rewrite it.
+function sanitizeEngineMessage(line) {
+  if (!line) return line;
+  return line
+    .replace(/\s*;?\s*please report this issue on\s+https?:\/\/github\.com\/yt-dlp\/yt-dlp\/issues\S*[^.]*\.?/gi, '')
+    .replace(/\s*Confirm you are on the latest version using\s+yt-dlp\s+-U\.?/gi, '')
+    .replace(/\byt-dlp\b/g, 'the engine')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
 function historyItemFrom(job) {
   const size = filePathSize(job.filePath);
   return {
@@ -1155,8 +1384,21 @@ function historyItemFrom(job) {
     mode: job.options.mode,
     status: job.status,
     errorMessage: job.errorMessage,
+    consoleLog: (job.logLines || []).join('\n'),
     fileSizeBytes: size,
   };
+}
+
+// Cap the per-job log buffer so a runaway process can't pin unbounded memory.
+// 2000 lines is comfortably above what a normal failed download produces.
+const MAX_LOG_LINES = 2000;
+function appendLogLine(job, line) {
+  if (!job) return;
+  if (!Array.isArray(job.logLines)) job.logLines = [];
+  job.logLines.push(line);
+  if (job.logLines.length > MAX_LOG_LINES) {
+    job.logLines.splice(0, job.logLines.length - MAX_LOG_LINES);
+  }
 }
 
 // Buffer child stdout/stderr into complete lines before dispatch.
@@ -1238,6 +1480,10 @@ app.whenReady().then(() => {
   if (process.platform === 'darwin' && app.dock && fs.existsSync(APP_ICON_PATH)) {
     try { app.dock.setIcon(nativeImage.createFromPath(APP_ICON_PATH)); } catch { /* ignore */ }
   }
+  // Drop any decrypted-cookie temp files left behind by a previous crash
+  // before we start writing fresh ones. Cheap and bounded — only inspects
+  // names matching the airfetch-arc-* pattern.
+  if (process.platform === 'darwin') cleanupOrphanedArcCookieFiles();
   manager = new Manager();
   const win = createWindow();
   manager.attach(win);
