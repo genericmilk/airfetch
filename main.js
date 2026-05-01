@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, dialog, clipboard, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, clipboard, nativeImage, Notification } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -113,6 +113,7 @@ const DEFAULT_PREFS = () => ({
   cookiesBrowser: 'safari',
   cookiesProfile: '',
   onboardingCompleted: false,
+  notifyOnComplete: true,
   defaults: DEFAULT_OPTIONS(),
 });
 
@@ -799,6 +800,7 @@ class Manager {
     this.history = this.history.filter(h => h.id !== entry.id);
     this.history.unshift(entry);
     this.saveHistory();
+    this.notifyJobFinished(entry);
   }
 
   onStderr(jobId, raw) {
@@ -863,8 +865,45 @@ class Manager {
       }
     }
     log('info', `job=${jobId.slice(0, 8)} exit=${code} status=${job.status}`);
+    // Skip when the playlist path already fired per-entry notifications;
+    // those handle the success cases. The container exit only matters
+    // here for failure notifications.
+    const playlistAlreadyNotified = job.isPlaylist && job.completedEntries.length > 0 && job.status === 'finished';
+    if (!playlistAlreadyNotified) this.notifyJobFinished(job);
     this.moveToHistory(jobId);
     this.broadcast();
+  }
+
+  notifyJobFinished(job) {
+    if (!this.prefs.notifyOnComplete) return;
+    if (!Notification.isSupported()) return;
+    const isFailure = job.status === 'failed' || job.status === 'cancelled';
+    const title = isFailure
+      ? (job.status === 'cancelled' ? 'Download cancelled' : 'Download failed')
+      : 'Download complete';
+    const body = job.title || job.url || '';
+    const note = new Notification({
+      title,
+      body,
+      silent: false,
+      icon: nativeImage.createFromPath(APP_ICON_PATH),
+    });
+    if (job.filePath) {
+      // Click reveals the finished file in Finder/Explorer/Files. Failure
+      // notifications just focus the app so the user can see the row.
+      note.on('click', () => {
+        if (isFailure) {
+          if (this.win && !this.win.isDestroyed()) this.win.focus();
+        } else {
+          shell.showItemInFolder(job.filePath);
+        }
+      });
+    } else {
+      note.on('click', () => {
+        if (this.win && !this.win.isDestroyed()) this.win.focus();
+      });
+    }
+    note.show();
   }
 
   // ── yt-dlp install ──────────────────────────────────────────────────────
@@ -1043,6 +1082,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      scrollBounce: true,
     },
   });
   // `trafficLightPosition` is only applied at construction; re-apply on load
@@ -1065,6 +1105,11 @@ function createWindow() {
   }
   return win;
 }
+
+// Windows uses the AppUserModelID to title notifications and to group
+// shortcuts in the taskbar. Without this, toasts read "electron.app" on
+// Win 10/11. Must be set before any Notification is shown.
+if (process.platform === 'win32') app.setAppUserModelId('com.peterday.airfetch');
 
 app.whenReady().then(() => {
   if (process.platform === 'darwin' && app.dock && fs.existsSync(APP_ICON_PATH)) {

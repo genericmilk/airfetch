@@ -2,12 +2,13 @@
 import SettingsRow from './SettingsRow.vue';
 import Toggle from '../Toggle.vue';
 import { state, api } from '../../store.js';
-import { bindDefault } from '../../bindings.js';
+import { bindDefault, bindPref } from '../../bindings.js';
 
 const outputTemplate = bindDefault('outputTemplate');
 const restrictFilenames = bindDefault('restrictFilenames');
 const downloadPlaylist = bindDefault('downloadPlaylist');
 const playlistItems = bindDefault('playlistItems');
+const notifyOnComplete = bindPref('notifyOnComplete');
 
 async function chooseFolder() {
   const p = await api.chooseFolder(state.prefs.defaults.outputDirectory);
@@ -28,6 +29,12 @@ async function chooseFolder() {
     <SettingsRow>
       <Toggle v-model="restrictFilenames" label="Restrict filenames to ASCII" />
     </SettingsRow>
+
+    <h3>Notifications</h3>
+    <SettingsRow>
+      <Toggle v-model="notifyOnComplete" label="Notify when a download finishes" />
+    </SettingsRow>
+    <p class="hint">Click the notification to reveal the file in {{ state.platform === 'win32' ? 'Explorer' : (state.platform === 'darwin' ? 'Finder' : 'your file manager') }}.</p>
 
     <h3>Playlists</h3>
     <SettingsRow>
