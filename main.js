@@ -1,6 +1,7 @@
 'use strict';
 
 const { app, BrowserWindow, ipcMain, shell, dialog, clipboard, nativeImage, Notification } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -211,18 +212,29 @@ function buildArguments(opts, urls) {
     args.push('--cookies', opts._arcCookiesFile);
   } else if (browser && browser.ytdlp) {
     let spec = browser.ytdlp;
+    let skip = false;
     const profile = (opts.cookiesBrowserProfile || '').trim();
-    if (profile) spec += `:${profile}`;
-    else if (opts.cookiesFromBrowser === 'chromeCanary') {
+    if (opts.cookiesFromBrowser === 'arc') {
+      // Arc-specific resolution: a profile hint like "Profile 1" must be
+      // joined to Arc's User Data dir, not handed verbatim to yt-dlp
+      // (which would resolve it against Chrome's standard path). On macOS
+      // this fallback only fires when our own decryption couldn't run; on
+      // Windows it's the primary path because Chromium's master key is a
+      // DPAPI blob inside `Local State` next to the profile and yt-dlp
+      // can decrypt it natively without any per-app keyring lookup.
+      const arcRoot = ARC_USER_DATA();
+      const profileDir = pickArcProfileDir(profile)
+        || (arcRoot ? path.join(arcRoot, 'Default') : null);
+      // Linux: Arc doesn't ship there, so leave cookies off rather than
+      // emitting a bogus path that would clutter logs with errors.
+      if (!profileDir) skip = true;
+      else spec += `:${profileDir}`;
+    } else if (profile) {
+      spec += `:${profile}`;
+    } else if (opts.cookiesFromBrowser === 'chromeCanary') {
       spec += `:${path.join(os.homedir(), 'Library/Application Support/Google/Chrome Canary/Default')}`;
     }
-    else if (opts.cookiesFromBrowser === 'arc') {
-      // Fallback when the keychain export couldn't run (non-darwin or
-      // Keychain access denied). Better than nothing, but the cookies will
-      // still come out garbled — we surface the export failure separately.
-      spec += `:${pickArcProfileDir(opts.cookiesBrowserProfile) || path.join(os.homedir(), 'Library/Application Support/Arc/User Data/Default')}`;
-    }
-    args.push('--cookies-from-browser', spec);
+    if (!skip) args.push('--cookies-from-browser', spec);
   }
   if (opts.cookiesFile) args.push('--cookies', opts.cookiesFile);
 
@@ -428,11 +440,6 @@ function normalizeAppVersion(s) {
   return String(s || '').trim().replace(/^v/i, '').split('-')[0];
 }
 
-async function fetchLatestAppRelease() {
-  const url = `https://api.github.com/repos/${APP_REPO}/releases/latest`;
-  return fetchJSON(url);
-}
-
 // Run on every launch (after a managed install exists). If a previous session
 // staged a newer binary at BIN_UPGRADE_PATH, atomically replace BIN_PATH with
 // it; otherwise discard a stale or older stage.
@@ -515,13 +522,37 @@ async function stageBackgroundUpgrade(currentVersion) {
 
 // ─────────────────────────────────────────────────────── arc cookies ──────
 // yt-dlp doesn't natively support Arc and treats `--cookies-from-browser arc:…`
-// as Chrome — so it queries the wrong macOS Keychain entry ("Chrome Safe
-// Storage" instead of "Arc Safe Storage"), the AES-CBC decrypt fails for
-// every cookie, and the request goes out logged-out. We work around this by
-// reading Arc's cookie jar ourselves, decrypting with the right key, and
-// writing a Netscape cookies.txt that yt-dlp can ingest via --cookies.
-const ARC_USER_DATA = () =>
-  path.join(os.homedir(), 'Library/Application Support/Arc/User Data');
+// as Chrome. On macOS that means it queries the wrong Keychain entry
+// ("Chrome Safe Storage" instead of "Arc Safe Storage"), the AES-CBC decrypt
+// fails, and the request goes out logged-out — so we read Arc's jar
+// ourselves and feed yt-dlp a Netscape cookies.txt via --cookies. Windows
+// is different: Chromium stores its master key DPAPI-encrypted inside
+// `Local State` next to the profile, with no per-app service-name lookup,
+// so pointing yt-dlp at Arc's profile dir is enough. Linux has no Arc.
+function ARC_USER_DATA() {
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library/Application Support/Arc/User Data');
+  }
+  if (process.platform === 'win32') {
+    // Arc on Windows ships as an MSIX package. The publisher hash
+    // ("ttt1ap7aakyb4") comes from The Browser Company's signing cert and
+    // is stable, but glob the Packages dir anyway in case it ever rolls.
+    const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    const packagesDir = path.join(local, 'Packages');
+    try {
+      for (const name of fs.readdirSync(packagesDir)) {
+        if (/^TheBrowserCompany\.Arc_/.test(name)) {
+          return path.join(packagesDir, name, 'LocalCache', 'Local', 'Arc', 'User Data');
+        }
+      }
+    } catch { /* no Packages dir = Arc not installed */ }
+    // Fall through to the canonical name so callers still get a useful
+    // path to surface in error messages instead of null.
+    return path.join(local, 'Packages', 'TheBrowserCompany.Arc_ttt1ap7aakyb4',
+      'LocalCache', 'Local', 'Arc', 'User Data');
+  }
+  return null;
+}
 const ARC_KEYCHAIN_SERVICE = 'Arc Safe Storage';
 const PBKDF2_SALT = 'saltysalt';
 const PBKDF2_ITER = 1003;
@@ -538,6 +569,7 @@ const CHROMIUM_IV = Buffer.alloc(16, 0x20);
 // anyone who's used Spaces.
 function pickArcProfileDir(profileHint) {
   const base = ARC_USER_DATA();
+  if (!base) return null;
   const trimmed = (profileHint || '').trim();
   if (trimmed) return path.isAbsolute(trimmed) ? trimmed : path.join(base, trimmed);
   let entries;
@@ -701,7 +733,8 @@ class Manager {
     this.ytdlpVersion = '';
     this.launchError = null;
     this.upgradeState = { status: 'idle', progress: 0, output: '', lastTag: '' };
-    // App-self-update state. status: idle|checking|up-to-date|available|error.
+    // App-self-update state, driven by electron-updater events.
+    // status: idle|checking|up-to-date|available|downloading|downloaded|error.
     this.appUpdate = {
       status: 'idle',
       currentVersion: app.getVersion(),
@@ -712,12 +745,11 @@ class Manager {
       error: '',
       checkedAt: '',
       dismissed: false,
+      progress: { percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 },
     };
-    // Highest version we've already shown a notification for in this session.
-    // Prevents re-notifying on every periodic check or after the user has
-    // already been told.
     this.appUpdateNotifiedFor = '';
     this.appUpdateTimer = null;
+    this.appUpdaterWired = false;
     this.win = null;
     this.ensureOutputDir();
   }
@@ -1187,70 +1219,161 @@ class Manager {
   }
 
   // ── app self-update ─────────────────────────────────────────────────────
-  // Polls the GitHub releases endpoint for genericmilk/airfetch, compares
-  // against app.getVersion(), and updates this.appUpdate. We don't auto-
-  // install — the build is unsigned on macOS/Windows, so an in-place swap
-  // would either fail Gatekeeper or trip SmartScreen. The renderer offers
-  // a button to open the release page; the user runs the platform installer.
-  async checkAppUpdate({ silent = false } = {}) {
-    if (this.appUpdate.status === 'checking') return this.appUpdate;
-    const previousLatest = this.appUpdate.latestVersion;
-    this.appUpdate = { ...this.appUpdate, status: 'checking', error: '' };
-    this.broadcast();
-    try {
-      const release = await fetchLatestAppRelease();
-      const tag = release.tag_name || '';
-      const latest = normalizeAppVersion(tag);
-      const current = normalizeAppVersion(this.appUpdate.currentVersion);
-      const cmp = latest && current ? compareVersions(current, latest) : 0;
-      const isNewer = cmp < 0;
-      // Reset the dismissed flag if we discover a *newer* tag than the one
-      // the user already dismissed — don't keep a banner permanently hidden
-      // when v0.2.0 lands after they dismissed v0.1.5.
-      const dismissed = this.appUpdate.dismissed && latest === previousLatest;
+  // Driven by electron-updater. Listening to its events updates this.appUpdate;
+  // checkAppUpdate kicks the check, and installAppUpdate quits + applies the
+  // staged installer. macOS auto-update REQUIRES the build to be code-signed:
+  // Squirrel.Mac verifies the new bundle's signature against the running one.
+  // On unsigned macOS builds the download succeeds but quitAndInstall surfaces
+  // "Could not get code signature" via the 'error' event, which we propagate
+  // to the renderer rather than silently failing.
+  wireAutoUpdater() {
+    if (this.appUpdaterWired) return;
+    this.appUpdaterWired = true;
+    if (!app.isPackaged) {
+      log('info', 'app updater: skipping wire-up (running unpackaged / dev)');
+      return;
+    }
+    autoUpdater.autoDownload = true;
+    autoUpdater.autoInstallOnAppQuit = true;
+    autoUpdater.logger = {
+      info:  (m) => log('info',  `app updater: ${m}`),
+      warn:  (m) => log('info',  `app updater warn: ${m}`),
+      error: (m) => log('error', `app updater: ${m}`),
+      debug: () => {},
+    };
+    autoUpdater.on('checking-for-update', () => {
+      this.appUpdate = { ...this.appUpdate, status: 'checking', error: '' };
+      this.broadcast();
+    });
+    autoUpdater.on('update-available', (info) => {
+      const latest = normalizeAppVersion(info?.version || '');
       this.appUpdate = {
         ...this.appUpdate,
-        status: isNewer ? 'available' : 'up-to-date',
+        status: 'downloading',
         latestVersion: latest,
-        releaseUrl: release.html_url || APP_RELEASES_PAGE,
-        releaseNotes: release.body || '',
-        publishedAt: release.published_at || '',
+        releaseNotes: typeof info?.releaseNotes === 'string' ? info.releaseNotes : '',
+        publishedAt: info?.releaseDate || '',
         error: '',
         checkedAt: new Date().toISOString(),
-        dismissed,
+        progress: { percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 },
       };
-      log('info', `app updater: current=${current} latest=${latest || '?'} → ${this.appUpdate.status}`);
-      // Notify on first discovery of this latest version (whether the call
-      // was triggered by a manual check or the background timer). Silent
-      // suppresses the toast but the banner still appears in the UI.
-      if (isNewer && !silent && this.appUpdateNotifiedFor !== latest) {
+      if (this.appUpdateNotifiedFor !== latest) {
         this.notifyAppUpdateAvailable();
         this.appUpdateNotifiedFor = latest;
       }
       this.broadcast();
+    });
+    autoUpdater.on('update-not-available', (info) => {
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: 'up-to-date',
+        latestVersion: normalizeAppVersion(info?.version || this.appUpdate.currentVersion),
+        error: '',
+        checkedAt: new Date().toISOString(),
+      };
+      this.broadcast();
+    });
+    autoUpdater.on('download-progress', (p) => {
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: 'downloading',
+        progress: {
+          percent: p?.percent || 0,
+          transferred: p?.transferred || 0,
+          total: p?.total || 0,
+          bytesPerSecond: p?.bytesPerSecond || 0,
+        },
+      };
+      this.broadcast();
+    });
+    autoUpdater.on('update-downloaded', (info) => {
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: 'downloaded',
+        latestVersion: normalizeAppVersion(info?.version || this.appUpdate.latestVersion),
+        progress: { percent: 100, transferred: 0, total: 0, bytesPerSecond: 0 },
+      };
+      this.notifyAppUpdateReady();
+      this.broadcast();
+    });
+    autoUpdater.on('error', (err) => {
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: 'error',
+        error: err?.message || String(err),
+        checkedAt: new Date().toISOString(),
+      };
+      this.broadcast();
+    });
+  }
+
+  async checkAppUpdate() {
+    this.wireAutoUpdater();
+    if (!app.isPackaged) {
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: 'up-to-date',
+        error: '',
+        checkedAt: new Date().toISOString(),
+      };
+      this.broadcast();
       return this.appUpdate;
+    }
+    if (this.appUpdate.status === 'checking' || this.appUpdate.status === 'downloading') {
+      return this.appUpdate;
+    }
+    try {
+      await autoUpdater.checkForUpdates();
     } catch (err) {
       this.appUpdate = {
         ...this.appUpdate,
         status: 'error',
-        error: err.message || String(err),
+        error: err?.message || String(err),
         checkedAt: new Date().toISOString(),
       };
-      log('error', `app updater: check failed: ${err.message}`);
       this.broadcast();
-      return this.appUpdate;
+    }
+    return this.appUpdate;
+  }
+
+  // Called when the user clicks "Restart now" after an update has been
+  // downloaded. Quits, runs the platform installer, relaunches. If the user
+  // never clicks it, autoInstallOnAppQuit applies the update on next quit.
+  installAppUpdate() {
+    if (!app.isPackaged) return;
+    if (this.appUpdate.status !== 'downloaded') return;
+    try {
+      autoUpdater.quitAndInstall();
+    } catch (err) {
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: 'error',
+        error: err?.message || String(err),
+      };
+      this.broadcast();
     }
   }
 
   notifyAppUpdateAvailable() {
     if (!Notification.isSupported()) return;
     const note = new Notification({
-      title: `Airfetch ${this.appUpdate.latestVersion} is available`,
-      body: 'Click to view the release.',
+      title: `Airfetch ${this.appUpdate.latestVersion} is downloading`,
+      body: 'It will install the next time you quit Airfetch.',
       silent: false,
       icon: nativeImage.createFromPath(APP_ICON_PATH),
     });
-    note.on('click', () => shell.openExternal(this.appUpdate.releaseUrl));
+    note.show();
+  }
+
+  notifyAppUpdateReady() {
+    if (!Notification.isSupported()) return;
+    const note = new Notification({
+      title: `Airfetch ${this.appUpdate.latestVersion} is ready to install`,
+      body: 'Click to restart Airfetch and apply the update.',
+      silent: false,
+      icon: nativeImage.createFromPath(APP_ICON_PATH),
+    });
+    note.on('click', () => this.installAppUpdate());
     note.show();
   }
 
@@ -1263,14 +1386,15 @@ class Manager {
     this.broadcast();
   }
 
-  // Re-poll the GitHub releases API every 6 hours while the app is open.
-  // The first call (after the launch-time silent one) will fire a system
-  // notification when a new version is found.
+  // Re-check every 6 hours while the app is open. autoUpdater no-ops the
+  // call once an update is already downloaded for the running session, so
+  // this just keeps the renderer's state honest if the app stays open for
+  // days.
   startAppUpdateTimer() {
     if (this.appUpdateTimer) return;
     const SIX_HOURS = 6 * 60 * 60 * 1000;
     this.appUpdateTimer = setInterval(() => {
-      this.checkAppUpdate({ silent: false }).catch(() => { /* logged inside */ });
+      this.checkAppUpdate().catch(() => { /* logged inside */ });
     }, SIX_HOURS);
     if (this.appUpdateTimer.unref) this.appUpdateTimer.unref();
   }
@@ -1499,7 +1623,8 @@ app.whenReady().then(() => {
     // Cold-start check is non-silent so a friend who launches a stale build
     // gets the system toast immediately. Subsequent periodic checks rely on
     // appUpdateNotifiedFor to avoid re-toasting the same version.
-    manager.checkAppUpdate({ silent: false });
+    manager.wireAutoUpdater();
+    manager.checkAppUpdate();
     manager.startAppUpdateTimer();
   });
 
@@ -1540,7 +1665,8 @@ ipcMain.handle('dismissLaunchError', () => manager.setLaunchError(null));
 ipcMain.handle('install', () => manager.installOrUpgrade());
 ipcMain.handle('resetUpgradeState', () => manager.resetUpgradeState());
 
-ipcMain.handle('checkAppUpdate', () => manager.checkAppUpdate({ silent: false }));
+ipcMain.handle('checkAppUpdate', () => manager.checkAppUpdate());
+ipcMain.handle('installAppUpdate', () => manager.installAppUpdate());
 ipcMain.handle('openReleasePage', () => manager.openReleasePage());
 ipcMain.handle('dismissAppUpdate', () => manager.dismissAppUpdate());
 
