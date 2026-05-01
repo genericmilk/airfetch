@@ -15,6 +15,10 @@ const props = defineProps({ item: { type: Object, required: true } });
 const showsBackdrop = computed(() => props.item.status === 'finished');
 const cardStyle = { '--progress': '100%' };
 
+const showError = computed(() =>
+  (props.item.status === 'failed' || props.item.status === 'cancelled') && !!props.item.errorMessage
+);
+
 function openMenu(e) {
   const item = props.item;
   const items = [];
@@ -26,6 +30,9 @@ function openMenu(e) {
   items.push({ label: 'Copy URL', onClick: () => api.writeClipboard(item.url) });
   if (item.filePath) {
     items.push({ label: 'Copy file path', onClick: () => api.writeClipboard(item.filePath) });
+  }
+  if (item.errorMessage) {
+    items.push({ label: 'Copy error', onClick: () => api.writeClipboard(item.errorMessage) });
   }
   items.push({ label: 'Download again', onClick: () => api.retry(item.id) });
   items.push({ separator: true });
@@ -53,6 +60,9 @@ function openMenu(e) {
           <span class="dot">·</span>
           <span>{{ formatSize(item.fileSizeBytes) }}</span>
         </template>
+      </div>
+      <div v-if="showError" class="row-sub error-line" :title="item.errorMessage">
+        <span class="error">{{ item.errorMessage }}</span>
       </div>
     </div>
     <HistoryActions :item="item" @open-menu="openMenu" />

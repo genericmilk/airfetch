@@ -174,7 +174,9 @@ textarea { resize: vertical; font-size: 12px; }
 /* ─── main ────────────────────────────────────────────────── */
 #page {
   flex: 1;
-  overflow: auto;
+  min-height: 0;
+  overflow-y: scroll;
+  overscroll-behavior-y: auto;
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -438,6 +440,24 @@ textarea { resize: vertical; font-size: 12px; }
 }
 .row-sub .error { color: var(--red); }
 .row-sub .warn { color: var(--orange); }
+.row-sub.error-line { min-width: 0; }
+.row-sub.error-line .error {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* On rows with a colourful artwork backdrop, force text to white and
+   add a subtle shadow so it stays legible over bright/light tones (the
+   left-side darkening gradient alone isn't enough once the wipe reveals
+   the colour layer all the way across). */
+.row-card.has-artwork .row-title,
+.row-card.has-artwork .row-sub,
+.row-card.has-artwork .row-sub .uploader,
+.row-card.has-artwork .row-sub .log {
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6), 0 0 1px rgba(0, 0, 0, 0.5);
+}
 .row-actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
 .row-actions button.small { font-size: 11px; padding: 4px 8px; }
 .row-actions .cancel { color: var(--red); }
