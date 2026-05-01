@@ -16,6 +16,7 @@ const statusLabel = computed(() => {
   if (errored.value) return `Couldn't check: ${upd.value.error}`;
   return '';
 });
+
 </script>
 
 <template>
@@ -42,6 +43,7 @@ const statusLabel = computed(() => {
           :class="{ 'is-available': available, 'is-error': errored }"
         >{{ statusLabel }}</span>
       </div>
+
     </div>
   </section>
 </template>

@@ -32,7 +32,10 @@ function openMenu(e) {
     items.push({ label: 'Copy file path', onClick: () => api.writeClipboard(item.filePath) });
   }
   if (item.errorMessage) {
-    items.push({ label: 'Copy error', onClick: () => api.writeClipboard(item.errorMessage) });
+    items.push({
+      label: 'Copy error',
+      onClick: () => api.writeClipboard(item.consoleLog || item.errorMessage),
+    });
   }
   items.push({ label: 'Download again', onClick: () => api.retry(item.id) });
   items.push({ separator: true });
