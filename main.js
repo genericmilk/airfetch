@@ -115,6 +115,12 @@ const DEFAULT_PREFS = () => ({
   cookiesProfile: '',
   onboardingCompleted: false,
   notifyOnComplete: true,
+  // Cap parallel downloads so a 100-URL batch doesn't fork 100 yt-dlp
+  // processes at once — that thrashes the network (sites rate-limit and
+  // start returning 412/429), spikes RAM (each yt-dlp is a ~50-100 MB
+  // PyInstaller bundle), and bottlenecks ffmpeg postprocessing on a
+  // single CPU. 4 is a safe default; users can override in prefs.json.
+  maxConcurrentDownloads: 4,
   defaults: DEFAULT_OPTIONS(),
 });
 
@@ -705,6 +711,47 @@ function cleanupArcCookieFile(p) {
   try { fs.unlinkSync(p); } catch { /* ok */ }
 }
 
+// Cached Arc cookie export. The export itself is expensive — VACUUM INTO,
+// 4k+ row read, AES-CBC decrypt per row, ~300-500 ms total — and runs
+// synchronously on the main thread. Doing it once per spawn made batch
+// downloads (e.g. queueing 100 URLs at once) freeze the UI for tens of
+// seconds while jobs serialised through the cookie export.
+//
+// Reuse the same exported file as long as Arc's underlying cookie DB
+// hasn't been touched. Invalidate by stat mtime so the next download
+// after a fresh login picks up the new session jar.
+let arcCookieCache = null; // { profileDir, mtime, path }
+
+function getArcCookiesFile(profileHint) {
+  const profileDir = pickArcProfileDir(profileHint);
+  if (!profileDir) throw new Error('No Arc profile directory found');
+  const cookiesDb = path.join(profileDir, 'Cookies');
+  let mtime;
+  try { mtime = fs.statSync(cookiesDb).mtimeMs; }
+  catch { throw new Error(`Arc cookies database missing: ${cookiesDb}`); }
+
+  if (arcCookieCache
+      && arcCookieCache.profileDir === profileDir
+      && arcCookieCache.mtime === mtime
+      && fs.existsSync(arcCookieCache.path)) {
+    return arcCookieCache.path;
+  }
+
+  const fresh = exportArcCookies(profileHint);
+  // Replace the prior cache only after the new export succeeds, so a thrown
+  // error doesn't leave us with no cookies at all. yt-dlp reads the file at
+  // process start, so deleting the old one here doesn't disturb downloads
+  // already in flight.
+  if (arcCookieCache) cleanupArcCookieFile(arcCookieCache.path);
+  arcCookieCache = { profileDir, mtime, path: fresh };
+  return fresh;
+}
+
+function invalidateArcCookieCache() {
+  if (arcCookieCache) cleanupArcCookieFile(arcCookieCache.path);
+  arcCookieCache = null;
+}
+
 // Sweep stale Arc-cookie temp files left behind by prior crashes. Runs once
 // at startup so /tmp doesn't accumulate decrypted cookie jars across runs.
 function cleanupOrphanedArcCookieFiles() {
@@ -801,6 +848,8 @@ class Manager {
     }
     this.savePrefs();
     this.ensureOutputDir();
+    // If the cap was raised, drain the queue into the new slots immediately.
+    if ('maxConcurrentDownloads' in patch) this.dispatchQueue();
     this.broadcast();
   }
 
@@ -810,6 +859,34 @@ class Manager {
   }
 
   // ── jobs ────────────────────────────────────────────────────────────────
+  // Active downloads — anything with a live yt-dlp child process. Drives the
+  // concurrency cap. Playlist jobs count once even though they download
+  // many videos, since they're a single child process.
+  runningCount() {
+    return this.jobs.filter(j => j.status === 'running' || j.status === 'merging').length;
+  }
+
+  concurrencyLimit() {
+    const n = this.prefs.maxConcurrentDownloads;
+    return Number.isFinite(n) && n > 0 ? n : 4;
+  }
+
+  // Promote queued jobs into running ones until either the cap is hit or the
+  // queue drains. FIFO order — `this.jobs.unshift()` puts new jobs at the
+  // head, so the oldest queued job sits at the tail.
+  dispatchQueue() {
+    let slots = this.concurrencyLimit() - this.runningCount();
+    if (slots <= 0) return;
+    for (let i = this.jobs.length - 1; i >= 0 && slots > 0; i--) {
+      const j = this.jobs[i];
+      if (j.status !== 'queued') continue;
+      j.status = 'running';
+      j.lastLog = '';
+      this.launchProcess(j, j.options);
+      slots--;
+    }
+  }
+
   start(url, overrideOptions) {
     const cleaned = (url || '').trim();
     if (!cleaned) return null;
@@ -823,11 +900,15 @@ class Manager {
       cookiesFromBrowser: this.prefs.cookiesBrowser,
       cookiesBrowserProfile: this.prefs.cookiesProfile,
     };
+    // Decide before constructing the job so we don't spawn-then-kill if the
+    // cap is full. Queued jobs render with their normal row but show
+    // "Queued" in the subline until a slot opens.
+    const willQueue = this.runningCount() >= this.concurrencyLimit();
     const job = {
       id: randomUUID(),
       url: cleaned,
       options: opts,
-      status: 'running',
+      status: willQueue ? 'queued' : 'running',
       percent: 0,
       eta: '—',
       speed: '—',
@@ -840,7 +921,7 @@ class Manager {
       filePath: null,
       startedAt: new Date().toISOString(),
       finishedAt: null,
-      lastLog: '',
+      lastLog: willQueue ? 'Queued' : '',
       logLines: [],
       errorMessage: null,
       // Playlist mode: yt-dlp emits one [AFMETA]/[AFPROG]/[AFFILE] cycle per
@@ -852,21 +933,22 @@ class Manager {
       completedEntries: [],
     };
     this.jobs.unshift(job);
-    this.launchProcess(job, opts);
+    if (!willQueue) this.launchProcess(job, opts);
     this.broadcast();
     return job.id;
   }
 
   launchProcess(job, opts) {
-    // Re-export Arc cookies on every spawn (initial start + resume) so the
-    // freshest session jar lands in the temp file. Discard any prior export
-    // first; cookies may have rotated while the job was paused.
+    // Resolve Arc cookies via the module-level cache. Re-exporting per spawn
+    // used to block the main thread for ~300 ms each time, which serialised
+    // batch downloads behind tens of seconds of synchronous decryption. The
+    // cache invalidates when Arc's cookie DB mtime changes, so resumes and
+    // post-login refreshes still see fresh cookies.
     if (opts.cookiesFromBrowser === 'arc' && process.platform === 'darwin') {
-      cleanupArcCookieFile(opts._arcCookiesFile);
-      opts._arcCookiesFile = null;
       try {
-        opts._arcCookiesFile = exportArcCookies(opts.cookiesBrowserProfile);
+        opts._arcCookiesFile = getArcCookiesFile(opts.cookiesBrowserProfile);
       } catch (err) {
+        opts._arcCookiesFile = null;
         log('error', `Arc cookies export failed: ${err.message}`);
         job.lastLog = `Arc cookies unavailable: ${err.message}`;
       }
@@ -888,6 +970,17 @@ class Manager {
   }
 
   cancel(jobId) {
+    const job = this.jobs.find(j => j.id === jobId);
+    // Cancelling a queued job doesn't free a slot (it never had one) — just
+    // drop it. No child to kill, no dispatchQueue needed.
+    if (job && job.status === 'queued') {
+      job.status = 'cancelled';
+      job.finishedAt = new Date().toISOString();
+      job.errorMessage = 'Cancelled by user';
+      this.moveToHistory(jobId);
+      this.broadcast();
+      return;
+    }
     const run = this.runs.get(jobId);
     if (run && run.child && !run.child.killed) {
       try { run.child.kill(); } catch { /* ignore */ }
@@ -898,24 +991,20 @@ class Manager {
         }
       }, 3000);
     }
-    const job = this.jobs.find(j => j.id === jobId);
     if (job) {
       job.status = 'cancelled';
       job.finishedAt = new Date().toISOString();
       job.errorMessage = 'Cancelled by user';
-      // moveToHistory removes the job from this.jobs, so onExit's lookup
-      // returns undefined and its cleanup branch never runs. Clean up the
-      // Arc cookies temp file here instead.
-      cleanupArcCookieFile(job.options._arcCookiesFile);
-      job.options._arcCookiesFile = null;
       this.moveToHistory(jobId);
     }
+    // Cancelling a running job frees a slot; promote a queued job into it.
+    this.dispatchQueue();
     this.broadcast();
   }
 
   pause(jobId) {
     const job = this.jobs.find(j => j.id === jobId);
-    if (!job || job.status === 'paused' || isTerminal(job.status)) return;
+    if (!job || job.status === 'paused' || job.status === 'queued' || isTerminal(job.status)) return;
     // Flip status before killing so onExit doesn't mark the job failed.
     job.status = 'paused';
     job.eta = '—';
@@ -931,6 +1020,8 @@ class Manager {
       }, 3000);
     }
     log('info', `job=${jobId.slice(0, 8)} paused at ${job.percent}%`);
+    // Pause frees a slot — let the next queued job kick off.
+    this.dispatchQueue();
     this.broadcast();
   }
 
@@ -941,11 +1032,21 @@ class Manager {
       this.setLaunchError('Downloader Engine is not installed. Install it from the toolbar.');
       return;
     }
-    job.status = 'running';
     job.errorMessage = null;
     job.finishedAt = null;
-    log('info', `job=${jobId.slice(0, 8)} resuming from ${job.percent}%`);
-    this.launchProcess(job, job.options);
+    if (this.runningCount() >= this.concurrencyLimit()) {
+      // No free slot — re-queue and let the dispatcher pick it up when
+      // another job exits. Otherwise we'd exceed the cap on resume.
+      job.status = 'queued';
+      job.eta = '—';
+      job.speed = '—';
+      job.lastLog = 'Queued';
+      log('info', `job=${jobId.slice(0, 8)} resume queued (cap reached)`);
+    } else {
+      job.status = 'running';
+      log('info', `job=${jobId.slice(0, 8)} resuming from ${job.percent}%`);
+      this.launchProcess(job, job.options);
+    }
     this.broadcast();
   }
 
@@ -1142,17 +1243,14 @@ class Manager {
       }
     }
     log('info', `job=${jobId.slice(0, 8)} exit=${code} status=${job.status}`);
-    // Decrypted Arc cookies were written to a temp file just for this run;
-    // remove it now that the job has reached a terminal state. (Pause is
-    // handled by the early return above so the file survives a resume.)
-    cleanupArcCookieFile(job.options._arcCookiesFile);
-    job.options._arcCookiesFile = null;
     // Skip when the playlist path already fired per-entry notifications;
     // those handle the success cases. The container exit only matters
     // here for failure notifications.
     const playlistAlreadyNotified = job.isPlaylist && job.completedEntries.length > 0 && job.status === 'finished';
     if (!playlistAlreadyNotified) this.notifyJobFinished(job);
     this.moveToHistory(jobId);
+    // A slot just freed up — start the next queued job (if any).
+    this.dispatchQueue();
     this.broadcast();
   }
 
