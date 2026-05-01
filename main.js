@@ -406,6 +406,22 @@ function compareVersions(a, b) {
   return 0;
 }
 
+// ───────────────────────────────────────────────── app self-update ─────────
+const APP_REPO = 'genericmilk/airfetch';
+const APP_RELEASES_PAGE = `https://github.com/${APP_REPO}/releases/latest`;
+
+// "v0.1.2" → "0.1.2"; everything else passes through. Strips the "v" prefix
+// and any pre-release suffix so compareVersions can handle git tags vs the
+// bare semver carried in package.json's "version".
+function normalizeAppVersion(s) {
+  return String(s || '').trim().replace(/^v/i, '').split('-')[0];
+}
+
+async function fetchLatestAppRelease() {
+  const url = `https://api.github.com/repos/${APP_REPO}/releases/latest`;
+  return fetchJSON(url);
+}
+
 // Run on every launch (after a managed install exists). If a previous session
 // staged a newer binary at BIN_UPGRADE_PATH, atomically replace BIN_PATH with
 // it; otherwise discard a stale or older stage.
@@ -503,6 +519,23 @@ class Manager {
     this.ytdlpVersion = '';
     this.launchError = null;
     this.upgradeState = { status: 'idle', progress: 0, output: '', lastTag: '' };
+    // App-self-update state. status: idle|checking|up-to-date|available|error.
+    this.appUpdate = {
+      status: 'idle',
+      currentVersion: app.getVersion(),
+      latestVersion: '',
+      releaseUrl: APP_RELEASES_PAGE,
+      releaseNotes: '',
+      publishedAt: '',
+      error: '',
+      checkedAt: '',
+      dismissed: false,
+    };
+    // Highest version we've already shown a notification for in this session.
+    // Prevents re-notifying on every periodic check or after the user has
+    // already been told.
+    this.appUpdateNotifiedFor = '';
+    this.appUpdateTimer = null;
     this.win = null;
     this.ensureOutputDir();
   }
@@ -532,6 +565,7 @@ class Manager {
       ytdlpManagedInstalled: fs.existsSync(BIN_PATH()),
       launchError: this.launchError,
       upgradeState: this.upgradeState,
+      appUpdate: this.appUpdate,
       platform: process.platform,
       browsers: BROWSERS,
     };
@@ -936,6 +970,95 @@ class Manager {
     this.broadcast();
   }
 
+  // ── app self-update ─────────────────────────────────────────────────────
+  // Polls the GitHub releases endpoint for genericmilk/airfetch, compares
+  // against app.getVersion(), and updates this.appUpdate. We don't auto-
+  // install — the build is unsigned on macOS/Windows, so an in-place swap
+  // would either fail Gatekeeper or trip SmartScreen. The renderer offers
+  // a button to open the release page; the user runs the platform installer.
+  async checkAppUpdate({ silent = false } = {}) {
+    if (this.appUpdate.status === 'checking') return this.appUpdate;
+    const previousLatest = this.appUpdate.latestVersion;
+    this.appUpdate = { ...this.appUpdate, status: 'checking', error: '' };
+    this.broadcast();
+    try {
+      const release = await fetchLatestAppRelease();
+      const tag = release.tag_name || '';
+      const latest = normalizeAppVersion(tag);
+      const current = normalizeAppVersion(this.appUpdate.currentVersion);
+      const cmp = latest && current ? compareVersions(current, latest) : 0;
+      const isNewer = cmp < 0;
+      // Reset the dismissed flag if we discover a *newer* tag than the one
+      // the user already dismissed — don't keep a banner permanently hidden
+      // when v0.2.0 lands after they dismissed v0.1.5.
+      const dismissed = this.appUpdate.dismissed && latest === previousLatest;
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: isNewer ? 'available' : 'up-to-date',
+        latestVersion: latest,
+        releaseUrl: release.html_url || APP_RELEASES_PAGE,
+        releaseNotes: release.body || '',
+        publishedAt: release.published_at || '',
+        error: '',
+        checkedAt: new Date().toISOString(),
+        dismissed,
+      };
+      log('info', `app updater: current=${current} latest=${latest || '?'} → ${this.appUpdate.status}`);
+      // Notify on first discovery of this latest version (whether the call
+      // was triggered by a manual check or the background timer). Silent
+      // suppresses the toast but the banner still appears in the UI.
+      if (isNewer && !silent && this.appUpdateNotifiedFor !== latest) {
+        this.notifyAppUpdateAvailable();
+        this.appUpdateNotifiedFor = latest;
+      }
+      this.broadcast();
+      return this.appUpdate;
+    } catch (err) {
+      this.appUpdate = {
+        ...this.appUpdate,
+        status: 'error',
+        error: err.message || String(err),
+        checkedAt: new Date().toISOString(),
+      };
+      log('error', `app updater: check failed: ${err.message}`);
+      this.broadcast();
+      return this.appUpdate;
+    }
+  }
+
+  notifyAppUpdateAvailable() {
+    if (!Notification.isSupported()) return;
+    const note = new Notification({
+      title: `Airfetch ${this.appUpdate.latestVersion} is available`,
+      body: 'Click to view the release.',
+      silent: false,
+      icon: nativeImage.createFromPath(APP_ICON_PATH),
+    });
+    note.on('click', () => shell.openExternal(this.appUpdate.releaseUrl));
+    note.show();
+  }
+
+  openReleasePage() {
+    return shell.openExternal(this.appUpdate.releaseUrl || APP_RELEASES_PAGE);
+  }
+
+  dismissAppUpdate() {
+    this.appUpdate = { ...this.appUpdate, dismissed: true };
+    this.broadcast();
+  }
+
+  // Re-poll the GitHub releases API every 6 hours while the app is open.
+  // The first call (after the launch-time silent one) will fire a system
+  // notification when a new version is found.
+  startAppUpdateTimer() {
+    if (this.appUpdateTimer) return;
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+    this.appUpdateTimer = setInterval(() => {
+      this.checkAppUpdate({ silent: false }).catch(() => { /* logged inside */ });
+    }, SIX_HOURS);
+    if (this.appUpdateTimer.unref) this.appUpdateTimer.unref();
+  }
+
   // Best-effort: ask GitHub for the newest yt-dlp and stage it next to the
   // live binary so the *next* launch swaps it in. No-op when the user is
   // already running a manual install, no managed binary exists yet (first
@@ -1127,6 +1250,11 @@ app.whenReady().then(() => {
     await manager.resolveYtdlp();
     manager.broadcast();
     manager.backgroundUpdateCheck();
+    // Cold-start check is non-silent so a friend who launches a stale build
+    // gets the system toast immediately. Subsequent periodic checks rely on
+    // appUpdateNotifiedFor to avoid re-toasting the same version.
+    manager.checkAppUpdate({ silent: false });
+    manager.startAppUpdateTimer();
   });
 
   app.on('activate', () => {
@@ -1165,6 +1293,10 @@ ipcMain.handle('dismissLaunchError', () => manager.setLaunchError(null));
 
 ipcMain.handle('install', () => manager.installOrUpgrade());
 ipcMain.handle('resetUpgradeState', () => manager.resetUpgradeState());
+
+ipcMain.handle('checkAppUpdate', () => manager.checkAppUpdate({ silent: false }));
+ipcMain.handle('openReleasePage', () => manager.openReleasePage());
+ipcMain.handle('dismissAppUpdate', () => manager.dismissAppUpdate());
 
 ipcMain.handle('revealInFinder', (_e, { path: p }) => {
   if (p) shell.showItemInFolder(p);

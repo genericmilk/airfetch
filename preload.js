@@ -24,6 +24,10 @@ contextBridge.exposeInMainWorld('airfetch', {
   install: () => invoke('install'),
   resetUpgradeState: () => invoke('resetUpgradeState'),
 
+  checkAppUpdate: () => invoke('checkAppUpdate'),
+  openReleasePage: () => invoke('openReleasePage'),
+  dismissAppUpdate: () => invoke('dismissAppUpdate'),
+
   revealInFinder: (p) => invoke('revealInFinder', { path: p }),
   openFile: (p) => invoke('openFile', { path: p }),
   openOutputDir: () => invoke('openOutputDir'),

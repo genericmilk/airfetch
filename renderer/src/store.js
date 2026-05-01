@@ -39,6 +39,17 @@ export const state = reactive({
   ytdlpManagedInstalled: false,
   launchError: null,
   upgradeState: { status: 'idle', progress: 0, output: '', lastTag: '' },
+  appUpdate: {
+    status: 'idle',
+    currentVersion: '',
+    latestVersion: '',
+    releaseUrl: '',
+    releaseNotes: '',
+    publishedAt: '',
+    error: '',
+    checkedAt: '',
+    dismissed: false,
+  },
   platform: '',
   browsers: [],
 });

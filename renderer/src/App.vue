@@ -2,6 +2,7 @@
 import { computed, onMounted, onBeforeUnmount } from 'vue';
 import ToolBar from './components/ToolBar.vue';
 import ErrorBanner from './components/ErrorBanner.vue';
+import UpdateBanner from './components/UpdateBanner.vue';
 import HistoryHeader from './components/HistoryHeader.vue';
 import RowsList from './components/RowsList.vue';
 import EmptyState from './components/EmptyState.vue';
@@ -48,9 +49,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeyDown));
 <template>
   <div>
     <ToolBar />
+    <UpdateBanner />
+    <ErrorBanner />
+    <HistoryHeader v-if="hasAny" />
     <main id="page">
-      <ErrorBanner />
-      <HistoryHeader v-if="hasAny" />
       <RowsList v-if="hasAny" />
       <EmptyState v-else />
     </main>
