@@ -832,10 +832,35 @@ class Manager {
     };
   }
 
+  // Coalesce bursts of state changes into ~20 IPC frames per second.
+  // Progress ticks fire 5-10 Hz per job and stderr/stdout lines arrive in
+  // bunches, so an unthrottled broadcast costs the renderer one full
+  // structured-clone of (jobs + history + prefs + ...) for every parsed
+  // line. Leading-edge fires immediately so the first event in a quiet
+  // window (job started, finished, status flip) lands instantly; trailing
+  // edge guarantees the final state of a burst always makes it through.
   broadcast() {
-    if (this.win && !this.win.isDestroyed()) {
+    if (!this.win || this.win.isDestroyed()) return;
+    const now = Date.now();
+    const elapsed = now - (this._lastBroadcast || 0);
+    const MIN_INTERVAL = 50;
+    if (elapsed >= MIN_INTERVAL) {
+      this._lastBroadcast = now;
+      if (this._broadcastTimer) {
+        clearTimeout(this._broadcastTimer);
+        this._broadcastTimer = null;
+      }
       this.win.webContents.send('state', this.snapshot());
+      return;
     }
+    if (this._broadcastTimer) return;
+    this._broadcastTimer = setTimeout(() => {
+      this._broadcastTimer = null;
+      this._lastBroadcast = Date.now();
+      if (this.win && !this.win.isDestroyed()) {
+        this.win.webContents.send('state', this.snapshot());
+      }
+    }, MIN_INTERVAL - elapsed);
   }
 
   savePrefs() { saveJSON(PREFS_PATH(), this.prefs); }

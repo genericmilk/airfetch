@@ -1,11 +1,12 @@
 <script setup>
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import ThumbnailBackdrop from './ThumbnailBackdrop.vue';
 import RowThumbnail from './RowThumbnail.vue';
 import StatusBadge from './StatusBadge.vue';
 import JobSubline from './JobSubline.vue';
 import JobActions from './JobActions.vue';
 import { jobPhase, progressValue } from '../utils.js';
+import { useNearViewport } from '../visibility.js';
 
 const props = defineProps({ job: { type: Object, required: true } });
 
@@ -16,17 +17,24 @@ const showsBackdrop = computed(() =>
 const cardStyle = computed(() => ({
   '--progress': `${Math.round(progressValue(props.job) * 100)}%`,
 }));
+
+// Each backdrop is three blurred layers and a GPU compositor cost. Defer
+// them until the row is near the viewport so a long batch doesn't stall
+// the compositor with hundreds of off-screen blur layers.
+const cardEl = ref(null);
+const inView = useNearViewport(cardEl);
 </script>
 
 <template>
   <div
+    ref="cardEl"
     class="row-card"
     :class="[`job-${phase}`, { 'has-artwork': showsBackdrop }]"
     :data-job-id="job.id"
     :data-phase="phase"
     :style="cardStyle"
   >
-    <ThumbnailBackdrop v-if="showsBackdrop" :thumbnail-url="job.thumbnailURL" />
+    <ThumbnailBackdrop v-if="showsBackdrop && inView" :thumbnail-url="job.thumbnailURL" />
     <RowThumbnail :thumbnail-url="job.thumbnailURL" :mode="job.options.mode" />
     <div class="row-body">
       <div class="row-title">{{ job.title || job.url }}</div>

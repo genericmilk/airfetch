@@ -1,11 +1,12 @@
 <script setup>
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import RowThumbnail from './RowThumbnail.vue';
 import StatusBadge from './StatusBadge.vue';
 import HistoryActions from './HistoryActions.vue';
 import ThumbnailBackdrop from './ThumbnailBackdrop.vue';
 import { api, openContextMenu } from '../store.js';
 import { relativeTime, formatSize } from '../utils.js';
+import { useNearViewport } from '../visibility.js';
 
 const props = defineProps({ item: { type: Object, required: true } });
 
@@ -14,6 +15,12 @@ const props = defineProps({ item: { type: Object, required: true } });
 // Without this, swapping JobRow→HistoryRow caused a visible opacity dip.
 const showsBackdrop = computed(() => props.item.status === 'finished');
 const cardStyle = { '--progress': '100%' };
+
+// History can grow large; each finished row's backdrop is three blurred
+// GPU layers. Defer mounting them until the row enters the viewport so
+// scrolling a long history isn't fighting hundreds of compositor layers.
+const cardEl = ref(null);
+const inView = useNearViewport(cardEl);
 
 const showError = computed(() =>
   (props.item.status === 'failed' || props.item.status === 'cancelled') && !!props.item.errorMessage
@@ -46,12 +53,13 @@ function openMenu(e) {
 
 <template>
   <div
+    ref="cardEl"
     class="row-card"
     :class="{ 'has-artwork': showsBackdrop, 'job-finished': showsBackdrop }"
     :style="cardStyle"
     @contextmenu.prevent="openMenu"
   >
-    <ThumbnailBackdrop v-if="showsBackdrop" :thumbnail-url="item.thumbnailURL" />
+    <ThumbnailBackdrop v-if="showsBackdrop && inView" :thumbnail-url="item.thumbnailURL" />
     <RowThumbnail :thumbnail-url="item.thumbnailURL" :mode="item.mode" />
     <div class="row-body">
       <div class="row-title">{{ item.title || item.url }}</div>

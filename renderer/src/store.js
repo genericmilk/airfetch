@@ -49,6 +49,7 @@ export const state = reactive({
     error: '',
     checkedAt: '',
     dismissed: false,
+    progress: { percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 },
   },
   platform: '',
   browsers: [],
@@ -69,11 +70,57 @@ export const ui = reactive({
 });
 
 export async function bootstrap() {
-  Object.assign(state, await api.getState());
+  applyState(await api.getState());
   // Block-bodied callback so the return value is undefined; an expression
   // body would return the reactive proxy, which Electron's contextBridge
   // can't clone back to the preload context.
-  api.onState(s => { Object.assign(state, s); });
+  api.onState(s => { applyState(s); });
+}
+
+// Merge a fresh snapshot from main into the reactive store WITHOUT
+// replacing references for unchanged data. The previous implementation
+// (`Object.assign(state, s)`) handed Vue a brand-new `jobs` array on every
+// IPC tick, so every JobRow's `:job` prop became a fresh proxy and every
+// downstream computed re-ran — even when nothing about that row had
+// changed. With 100+ rows and 20 broadcasts/sec, that ate the main
+// thread. Here we mutate the existing arrays/objects in place so Vue's
+// fine-grained reactivity only marks dirty the fields that actually
+// changed.
+function applyState(s) {
+  for (const key of Object.keys(s)) {
+    const next = s[key];
+    if (key === 'jobs' || key === 'history') {
+      mergeArrayById(state[key], next);
+    } else if (next && typeof next === 'object' && !Array.isArray(next)) {
+      if (!state[key] || typeof state[key] !== 'object') state[key] = {};
+      Object.assign(state[key], next);
+    } else {
+      state[key] = next;
+    }
+  }
+}
+
+function mergeArrayById(target, source) {
+  const byId = new Map();
+  for (const item of target) byId.set(item.id, item);
+  // Splice in place so reactive subscribers see one mutation rather than
+  // a wholesale replacement; reuse existing item objects so child
+  // components don't see new prop identities for unchanged data.
+  target.length = 0;
+  for (const incoming of source) {
+    const existing = byId.get(incoming.id);
+    if (!existing) {
+      target.push(incoming);
+      continue;
+    }
+    // Mutate only fields that differ. Strict-equality is enough for
+    // primitives and reference identity covers cases where main sends
+    // back the same nested object instance unchanged.
+    for (const k of Object.keys(incoming)) {
+      if (existing[k] !== incoming[k]) existing[k] = incoming[k];
+    }
+    target.push(existing);
+  }
 }
 
 // Derived collections used in multiple places. Both lists are scoped to
